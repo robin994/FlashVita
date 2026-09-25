@@ -1,0 +1,20 @@
+[package]
+name = "flashvita-ruffle-bridge"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+ruffle_core = { path = "../../third_party/ruffle/core", default-features = false, features = ["lzma"] }
+ruffle_render = { path = "../../third_party/ruffle/render", default-features = false, features = ["tessellator"] }
+swf = { path = "../../third_party/ruffle/swf", default-features = true }
+
+[profile.release]
+panic = "abort"
+lto = "thin"
+codegen-units = 1
+opt-level = 2
+
