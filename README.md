@@ -113,7 +113,7 @@ clocks increase power use; device measurements should confirm their effect.
 
 Ruffle is the runtime for both AVM1/ActionScript 1-2 and AVM2/ActionScript 3. FlashVita does not attempt to reimplement either VM. The Vita-specific work is concentrated in rendering, input, audio, storage, networking policy and performance.
 
-See `PORTING_STATUS.md` for the active milestone plan.
+See `PORTING_STATUS.md` for the active milestone plan and `docs/VITA_NATIVE_PLAN.md` for the Vita-native performance plan.
 
 ## DaedalusX64-vitaGL provenance
 
