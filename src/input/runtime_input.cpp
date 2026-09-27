@@ -3,6 +3,7 @@
 #include "../player/flash_player.h"
 
 #include <psp2/ctrl.h>
+#include <psp2/kernel/processmgr.h>
 #include <psp2/touch.h>
 
 #include <algorithm>
@@ -33,6 +34,7 @@ constexpr std::array<ButtonBinding, static_cast<size_t>(VitaControl::Count)> kBi
 }};
 
 constexpr size_t kBufferedInputSamples = 64;
+constexpr uint64_t kPointerIdleUs = 3'000'000;
 
 float stickDelta(uint8_t value, float speed) {
     constexpr int deadzone = 18;
@@ -43,6 +45,16 @@ float stickDelta(uint8_t value, float speed) {
 
 } // namespace
 
+bool RuntimeInput::cursorVisible() const {
+    return pointer_active_ &&
+           (previous_mouse_down_ || sceKernelGetProcessTimeWide() < cursor_visible_until_us_);
+}
+
+void RuntimeInput::markPointerActivity() {
+    pointer_active_ = true;
+    cursor_visible_until_us_ = sceKernelGetProcessTimeWide() + kPointerIdleUs;
+}
+
 void RuntimeInput::syncMouseButton(FlashPlayer& player) {
     const bool mouse_down = cross_mouse_down_ || front_touch_down_ || rear_touch_down_;
     if (mouse_down == previous_mouse_down_) return;
@@ -50,7 +62,7 @@ void RuntimeInput::syncMouseButton(FlashPlayer& player) {
     player.sendMouseMove(mouse_x_, mouse_y_);
     player.sendMouseButton(mouse_x_, mouse_y_, mouse_down);
     previous_mouse_down_ = mouse_down;
-    if (mouse_down) cursor_frames_ = 180;
+    markPointerActivity();
 }
 
 void RuntimeInput::update(FlashPlayer& player, const InputProfile& profile, uint32_t blocked_buttons) {
@@ -64,11 +76,10 @@ void RuntimeInput::update(FlashPlayer& player, const InputProfile& profile, uint
         last_pad_timestamp_ = 0;
         last_front_touch_timestamp_ = 0;
         last_rear_touch_timestamp_ = 0;
-        cursor_frames_ = 0;
+        pointer_active_ = false;
+        cursor_visible_until_us_ = 0;
         return;
     }
-
-    if (cursor_frames_ > 0) --cursor_frames_;
 
     std::array<SceCtrlData, kBufferedInputSamples> pads{};
     int pad_count = sceCtrlPeekBufferPositive(0, pads.data(), static_cast<int>(pads.size()));
@@ -124,7 +135,7 @@ void RuntimeInput::update(FlashPlayer& player, const InputProfile& profile, uint
             if (buffered_dx != 0.0f || buffered_dy != 0.0f) {
                 mouse_x_ = std::clamp(mouse_x_ + buffered_dx, 0.0f, 959.0f);
                 mouse_y_ = std::clamp(mouse_y_ + buffered_dy, 0.0f, 543.0f);
-                cursor_frames_ = 180;
+                markPointerActivity();
                 buffered_dx = 0.0f;
                 buffered_dy = 0.0f;
             }
@@ -139,7 +150,7 @@ void RuntimeInput::update(FlashPlayer& player, const InputProfile& profile, uint
     if (buffered_dx != 0.0f || buffered_dy != 0.0f) {
         mouse_x_ = std::clamp(mouse_x_ + buffered_dx, 0.0f, 959.0f);
         mouse_y_ = std::clamp(mouse_y_ + buffered_dy, 0.0f, 543.0f);
-        cursor_frames_ = 180;
+        markPointerActivity();
         pointer_moved = true;
     }
 
@@ -173,7 +184,7 @@ void RuntimeInput::update(FlashPlayer& player, const InputProfile& profile, uint
             if (down) {
                 latest_x = std::clamp(touch.report[0].x * 0.5f, 0.0f, 959.0f);
                 latest_y = std::clamp(touch.report[0].y * 0.5f, 0.0f, 543.0f);
-                cursor_frames_ = 180;
+                markPointerActivity();
                 moved = true;
             }
             if (down != source_down) {
@@ -202,6 +213,11 @@ void RuntimeInput::update(FlashPlayer& player, const InputProfile& profile, uint
                         last_rear_touch_timestamp_, rear_touch_down_);
 
     if (pointer_moved) player.sendMouseMove(mouse_x_, mouse_y_);
+    if (pointer_active_ && !previous_mouse_down_ && !cursorVisible()) {
+        player.sendMouseLeave();
+        pointer_active_ = false;
+        cursor_visible_until_us_ = 0;
+    }
 }
 
 void RuntimeInput::suspend(FlashPlayer& player, const InputProfile& profile) {
@@ -214,6 +230,7 @@ void RuntimeInput::suspend(FlashPlayer& player, const InputProfile& profile) {
         if (previous_mouse_down_) {
             player.sendMouseButton(mouse_x_, mouse_y_, false);
         }
+        if (pointer_active_) player.sendMouseLeave();
     }
     previous_buttons_ = 0;
     previous_mouse_down_ = false;
@@ -224,7 +241,8 @@ void RuntimeInput::suspend(FlashPlayer& player, const InputProfile& profile) {
     last_pad_timestamp_ = 0;
     last_front_touch_timestamp_ = 0;
     last_rear_touch_timestamp_ = 0;
-    cursor_frames_ = 0;
+    pointer_active_ = false;
+    cursor_visible_until_us_ = 0;
 }
 
 } // namespace flashvita

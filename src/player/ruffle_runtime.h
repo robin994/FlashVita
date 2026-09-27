@@ -40,6 +40,7 @@ public:
     bool keyEvent(int key, bool down);
     bool mouseMove(double x, double y);
     bool mouseButton(double x, double y, bool down);
+    bool mouseLeave();
     bool virtualKeyboardActive() const { return ime_active_; }
     void stop();
     bool running() const { return handle_ != nullptr; }

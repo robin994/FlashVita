@@ -46,7 +46,19 @@ static BRIDGE_VERSION: &[u8] = b"FlashVita Ruffle bridge 0.1 / Ruffle 0.6.0\0";
 #[cfg(target_os = "vita")]
 unsafe extern "C" {
     fn flashvita_vita_memblock_alloc(bytes: usize, uid_out: *mut i32) -> *mut c_void;
+    fn flashvita_vita_perf_logging_enabled() -> i32;
     fn flashvita_vita_memblock_free(uid: i32, base: *mut c_void) -> i32;
+}
+
+pub(crate) fn perf_logging_enabled() -> bool {
+    #[cfg(target_os = "vita")]
+    {
+        unsafe { flashvita_vita_perf_logging_enabled() != 0 }
+    }
+    #[cfg(not(target_os = "vita"))]
+    {
+        false
+    }
 }
 
 #[repr(C)]
@@ -69,6 +81,8 @@ pub struct FlashVitaRendererStats {
     colored_draws: u64,
     textured_draws: u64,
     bitmap_uploads: u64,
+    bitmap_partial_uploads: u64,
+    bitmap_uploaded_bytes: u64,
     lines: u64,
     gradient_skips: u64,
     missing_bitmaps: u64,
@@ -356,6 +370,8 @@ pub unsafe extern "C" fn flashvita_ruffle_renderer_stats(out: *mut FlashVitaRend
         colored_draws: stats.colored_draws,
         textured_draws: stats.textured_draws,
         bitmap_uploads: stats.bitmap_uploads,
+        bitmap_partial_uploads: stats.bitmap_partial_uploads,
+        bitmap_uploaded_bytes: stats.bitmap_uploaded_bytes,
         lines: stats.lines,
         gradient_skips: stats.gradient_skips,
         missing_bitmaps: stats.missing_bitmaps,
@@ -562,6 +578,12 @@ pub unsafe extern "C" fn flashvita_ruffle_headless_create(
         player_builder = player_builder.with_audio(audio);
     }
     let player = player_builder.build();
+    #[cfg(target_os = "vita")]
+    if let Ok(mut player_guard) = player.lock() {
+        // Vita has no stationary desktop pointer. Avoid hit-testing the whole
+        // display list until analog/touch input or a mouse click arrives.
+        player_guard.set_mouse_in_stage(false);
+    }
 
     if !out.is_null() {
         out.write(probe);
@@ -589,7 +611,7 @@ pub unsafe extern "C" fn flashvita_ruffle_headless_update(
     };
     player.tick(FloatDuration::from_millis(dt_ms.max(0.0)));
     handle.profile_ticks = handle.profile_ticks.wrapping_add(1);
-    if handle.profile_ticks % 10 == 0 {
+    if handle.profile_ticks % 30 == 0 && perf_logging_enabled() {
         let p = player.vita_frame_profile();
         vita_navigator::log_line(&format!(
             "avm_frame preload_us={} avm2_us={} avm1_us={} avm1_actions={} get_member={} set_member={} get_var={} set_var={} call_fn={} call_method={} push={} queued_us={} queued_actions={} mouse_us={} mouse_drag_us={} mouse_state_us={} mouse_pick_tests={} mouse_events={} mouse_actions={} gc_us={} update_calls={} run_frame_us={} timers_us={} timer_actions={} sockets_us={} net_us={} stream_us={} stream_body_us={} stream_active={} stream_queued={} audio_tick_us={} audio_us={} local_us={} callbacks_us={}",
@@ -720,6 +742,7 @@ pub unsafe extern "C" fn flashvita_ruffle_mouse_move(
     let Ok(mut player) = handle.player.lock() else {
         return -2;
     };
+    player.set_mouse_in_stage(true);
     player.handle_event(PlayerEvent::MouseMove { x, y });
     0
 }
@@ -737,6 +760,7 @@ pub unsafe extern "C" fn flashvita_ruffle_mouse_button(
     let Ok(mut player) = handle.player.lock() else {
         return -2;
     };
+    player.set_mouse_in_stage(true);
     let event = if down != 0 {
         PlayerEvent::MouseDown {
             x,
@@ -752,6 +776,19 @@ pub unsafe extern "C" fn flashvita_ruffle_mouse_button(
         }
     };
     player.handle_event(event);
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn flashvita_ruffle_mouse_leave(handle: *mut HeadlessPlayer) -> i32 {
+    let Some(handle) = handle.as_mut() else {
+        return -1;
+    };
+    let Ok(mut player) = handle.player.lock() else {
+        return -2;
+    };
+    player.set_mouse_in_stage(false);
+    player.handle_event(PlayerEvent::MouseLeave);
     0
 }
 

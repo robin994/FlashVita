@@ -87,6 +87,7 @@ std::atomic<uintptr_t> g_newlib_memblock_end{0};
 std::atomic<bool> g_phycont_spill_logged{false};
 std::atomic<bool> g_vram_spill_logged{false};
 std::atomic<bool> g_logging_enabled{true};
+std::atomic<bool> g_perf_logging_enabled{false};
 
 void rustAllocatorLog(const char* line) {
     if (!line || !g_logging_enabled.load(std::memory_order_relaxed)) return;
@@ -606,6 +607,14 @@ void setLoggingEnabled(bool enabled) {
 
 bool loggingEnabled() {
     return g_logging_enabled.load(std::memory_order_acquire);
+}
+
+void setPerfLoggingEnabled(bool enabled) {
+    g_perf_logging_enabled.store(enabled, std::memory_order_release);
+}
+
+bool perfLoggingEnabled() {
+    return loggingEnabled() && g_perf_logging_enabled.load(std::memory_order_acquire);
 }
 
 bool makeDirectories(const std::string& path) {
@@ -1235,4 +1244,8 @@ extern "C" void flashvita_vita_log_line(const char* line) {
 
 extern "C" int32_t flashvita_vita_logging_enabled(void) {
     return flashvita::vita::loggingEnabled() ? 1 : 0;
+}
+
+extern "C" int32_t flashvita_vita_perf_logging_enabled(void) {
+    return flashvita::vita::perfLoggingEnabled() ? 1 : 0;
 }

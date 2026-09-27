@@ -12,7 +12,6 @@ Build a native PS Vita SWF player with a DaedalusX64-vitaGL-inspired frontend, R
 - Native ELF/FSELF/VPK pipeline working.
 - Hardware bring-up found a pre-main prefetch abort in `__libc_init_array`: the custom Makefile was missing Vita's required linker relocation retention flag (`-Wl,-q`).
 - Fixed `LDFLAGS` to retain relocation records. This is required for ASLR/runtime relocation of C++ constructor pointers and other absolute references.
-- No commit or push performed.
 
 ## M1 - Native player shell - DONE
 
@@ -78,21 +77,20 @@ Real-hardware validation:
 - Bitmap fills inside tessellated vector shapes are resolved through `BitmapSource` and rendered with Ruffle's generated UV matrix.
 - Vector shape colors now apply Ruffle `ColorTransform`; textured content applies the multiplicative RGBA component as vertex modulation.
 - `DrawLine` and `DrawLineRect` are no longer dropped and use the vitaGL line path.
-- Dynamic bitmap updates currently use a correctness-first full texture re-upload; dirty-region uploads are a later optimization.
-- Renderer counters are exported through the Rust/C ABI and logged on first frame/every 600 ticks for colored draws, textured draws, uploads, lines, skipped gradients, missing bitmaps, masks and blends.
-- Ruffle rendering now follows the upstream `needs_render()` signal instead of redrawing unconditionally at the Vita refresh rate.
-- Fullscreen gameplay skips ImGui frame/render work entirely and only swaps buffers when Ruffle produced a new frame.
+- Dynamic bitmap updates use a packed dirty-region upload when less than half the bitmap changed; larger updates retain the full upload path. This needs real-hardware visual and timing validation.
+- Renderer counters are exported through the Rust/C ABI and logged when optional performance profiling is enabled, including partial uploads and uploaded bytes.
+- Fullscreen gameplay skips ImGui frame/render work and renders once per gameplay tick.
 - Per-draw temporary vertex buffers are reused instead of allocating a fresh `Vec` for every shape draw.
 - vitaGL client-state, texture binding, filter and wrap state are cached across Flash draws within a frame to reduce fixed-function state churn.
 - Stencil rendering uses Ruffle's `mask_index_count`, so stroke geometry is no longer incorrectly written into Flash masks.
-- Runtime profiling now logs 300-tick windows as `ruffle_perf` with rendered-frame count and average/max tick+render time against the 16.667 ms 60 Hz budget.
+- Optional runtime profiling logs 30-tick windows as `ruffle_perf` with rendered-frame count and average/max tick+render time against the 16.667 ms 60 Hz budget.
 - Renderer diagnostics now count `stage3d` submissions explicitly to distinguish actual Stage3D content from vector pseudo-3D SWFs.
 - Standard Ruffle masks now use the vitaGL stencil buffer with the native `PushMask -> ActivateMask -> DeactivateMask -> PopMask` sequence.
 - Linear gradients are rendered from a 256-sample texture ramp; radial/focal gradients use compact generated 64x64 textures and Ruffle's gradient UV matrix.
 - Gradient pad/repeat/reflect modes map to clamp/repeat/mirrored-repeat where applicable.
 - Alpha masks and nontrivial blend modes still retain simplified phase-1 behavior.
 - Stage3D and Pixel Bender explicitly return unsupported.
-- Remaining: alpha masks, nontrivial blend modes, additive textured ColorTransform, exact radial/focal spread outside the normalized gradient square, text/font fidelity, dirty-region texture updates and cache/batching work.
+- Remaining: alpha masks, nontrivial blend modes, additive textured ColorTransform, exact radial/focal spread outside the normalized gradient square, text/font fidelity and cache/batching work.
 
 ## M4 - Input bridge - IMPLEMENTED, NEEDS RUFFLE HARDWARE VALIDATION
 
@@ -106,9 +104,9 @@ Real-hardware validation:
 - v0.8 pauses Ruffle while the frontend is visible, releases held Flash inputs on entry, and restores a clean vitaGL state before ImGui. This avoids cross-contamination between ImGui and the Flash stencil/texture state.
 - The experimental `needs_render()` frame gating was removed after a severe hardware pacing regression; Ruffle renders once per gameplay tick again, using measured wall-clock delta time.
 
-## M5 - Audio and persistence - NOT STARTED
+## M5 - Audio and persistence - IN PROGRESS
 
-- Flash PCM/audio stream output through `sceAudioOut` or a lightweight Vita backend.
+- Native Ruffle audio mixer and `sceAudioOut` thread are integrated in source; hardware behavior still needs validation.
 - `SharedObject` persistence under `ux0:data/FlashVita/saves/`.
 - Pause/resume handling.
 
@@ -122,8 +120,8 @@ Real-hardware validation:
 
 ## Known limitations
 
-- The default `ENABLE_RUFFLE=0` VPK remains available as a UI/parser fallback, but the active hardware-tested build is now Ruffle-enabled.
+- The default VPK includes Ruffle; `ENABLE_RUFFLE=0` remains available for UI/parser regression work.
 - Standard stencil masks and primary gradient types are implemented but still need real-hardware fidelity validation; alpha masks, filters, complex blend modes and some text behavior remain incomplete.
 - Textured ColorTransform currently applies multiplicative RGBA only; additive channel offsets still need a shader-capable path or CPU fallback.
-- Audio still uses Ruffle's null backend; persistent SharedObject storage is not connected.
-- Networking/video/Stage3D/Pixel Bender are not implemented for Vita yet.
+- Audio uses the native Vita backend when initialization succeeds and falls back to Ruffle's null backend otherwise. Persistent SharedObject storage is not connected.
+- Native file and HTTP adapters are present; broader networking compatibility, video, Stage3D and Pixel Bender are not implemented for Vita yet.

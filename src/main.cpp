@@ -3,6 +3,7 @@
 #include <psp2/io/stat.h>
 #include <psp2/kernel/clib.h>
 #include <psp2/kernel/threadmgr.h>
+#include <psp2/power.h>
 #include <psp2/touch.h>
 
 #include <imgui_vita.h>
@@ -43,6 +44,21 @@ void ensureDataDirectories() {
     sceIoMkdir("ux0:data/FlashVita/saves", 0777);
 }
 
+void requestGameClocks() {
+    const int arm_result = scePowerSetArmClockFrequency(444);
+    const int bus_result = scePowerSetBusClockFrequency(222);
+    const int gpu_result = scePowerSetGpuClockFrequency(222);
+    const int xbar_result = scePowerSetGpuXbarClockFrequency(166);
+
+    char marker[192];
+    sceClibSnprintf(marker, sizeof(marker),
+                    "game_clocks arm=%d bus=%d gpu=%d xbar=%d result=%d,%d,%d,%d",
+                    scePowerGetArmClockFrequency(), scePowerGetBusClockFrequency(),
+                    scePowerGetGpuClockFrequency(), scePowerGetGpuXbarClockFrequency(),
+                    arm_result, bus_result, gpu_result, xbar_result);
+    logMarker(marker);
+}
+
 void drawRuntimeCursor(float x, float y) {
     const GLfloat vertices[] = {
         x, y,
@@ -81,6 +97,7 @@ int main() {
     flashvita::AppConfig config;
     config.load();
     flashvita::vita::setLoggingEnabled(config.enable_logs);
+    flashvita::vita::setPerfLoggingEnabled(config.enable_perf_logs);
     sceIoRemove("ux0:data/FlashVita/runtime.log");
     logMarker("pre_vita_native_init");
     const bool native_platform_ok = flashvita::vita::initialize();
@@ -94,6 +111,7 @@ int main() {
     }
 
     logMarker("config_loaded");
+    requestGameClocks();
 
     sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG_WIDE);
     sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_START);
@@ -102,6 +120,7 @@ int main() {
     vglSetSemanticBindingMode(VGL_MODE_SHADER_PAIR);
     vglInitExtended(0, 960, 544, 0x1000000, SCE_GXM_MULTISAMPLE_NONE);
     vglWaitVblankStart(config.vsync ? GL_TRUE : GL_FALSE);
+    bool applied_vsync = config.vsync;
     logMarker("vitagl_init_pass");
     flashvita_vita_rust_allocator_enable_vgl();
     {
@@ -151,8 +170,6 @@ int main() {
     uint32_t perf_game_frames = 0;
     uint64_t perf_loop_total_us = 0;
     uint64_t perf_loop_max_us = 0;
-    uint64_t perf_vblank_total_us = 0;
-    uint64_t perf_vblank_max_us = 0;
     uint64_t perf_game_total_us = 0;
     uint64_t perf_game_max_us = 0;
     uint64_t perf_swap_total_us = 0;
@@ -160,11 +177,13 @@ int main() {
     constexpr uint32_t kUiToggleMask = SCE_CTRL_LTRIGGER | SCE_CTRL_RTRIGGER | SCE_CTRL_START;
     for (;;) {
         bool loading_ready_to_show_game = false;
-        const uint64_t loop_begin_us = sceKernelGetProcessTimeWide();
+        const bool profile_frame = flashvita::vita::perfLoggingEnabled();
+        const uint64_t loop_begin_us = profile_frame ? sceKernelGetProcessTimeWide() : 0;
         sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DEFAULT);
-        const uint64_t vblank_begin_us = sceKernelGetProcessTimeWide();
-        vglWaitVblankStart(config.vsync ? GL_TRUE : GL_FALSE);
-        const uint64_t vblank_us = sceKernelGetProcessTimeWide() - vblank_begin_us;
+        if (applied_vsync != config.vsync) {
+            vglWaitVblankStart(config.vsync ? GL_TRUE : GL_FALSE);
+            applied_vsync = config.vsync;
+        }
         uint64_t game_work_us = 0;
 
         SceCtrlData raw_pad{};
@@ -201,7 +220,8 @@ int main() {
             glClear(GL_COLOR_BUFFER_BIT);
         }
         if (player_running && (!ui_visible || ui.launchLoading())) {
-            const uint64_t game_begin_us = sceKernelGetProcessTimeWide();
+            const bool measure_game = profile_frame || ui.launchLoading();
+            const uint64_t game_begin_us = measure_game ? sceKernelGetProcessTimeWide() : 0;
             const uint64_t now_us = sceKernelGetProcessTimeWide();
             double dt_ms = last_game_tick_us == 0
                 ? (1000.0 / 60.0)
@@ -220,7 +240,7 @@ int main() {
             if (!ui.launchLoading() && !player.virtualKeyboardActive() && runtime_input.cursorVisible()) {
                 drawRuntimeCursor(runtime_input.mouseX(), runtime_input.mouseY());
             }
-            game_work_us = sceKernelGetProcessTimeWide() - game_begin_us;
+            if (measure_game) game_work_us = sceKernelGetProcessTimeWide() - game_begin_us;
             if (ui.launchLoading() && game_work_us >= 500000) {
                 char marker[96];
                 sceClibSnprintf(marker, sizeof(marker), "loading_tick_us=%llu",
@@ -252,9 +272,9 @@ int main() {
                 logMarker(marker);
             }
         }
-        const uint64_t swap_begin_us = sceKernelGetProcessTimeWide();
+        const uint64_t swap_begin_us = profile_frame ? sceKernelGetProcessTimeWide() : 0;
         vglSwapBuffers(player.virtualKeyboardActive() ? GL_TRUE : GL_FALSE);
-        const uint64_t swap_us = sceKernelGetProcessTimeWide() - swap_begin_us;
+        const uint64_t swap_us = profile_frame ? sceKernelGetProcessTimeWide() - swap_begin_us : 0;
 
         if (loading_ready_to_show_game) {
             ui.setLaunchLoading(false);
@@ -276,31 +296,27 @@ int main() {
             }
         }
 
-        if (player_running && !ui_visible) {
+        if (profile_frame && player_running && !ui_visible) {
             const uint64_t loop_us = sceKernelGetProcessTimeWide() - loop_begin_us;
             perf_loop_total_us += loop_us;
             perf_loop_max_us = std::max(perf_loop_max_us, loop_us);
-            perf_vblank_total_us += vblank_us;
-            perf_vblank_max_us = std::max(perf_vblank_max_us, vblank_us);
             perf_game_total_us += game_work_us;
             perf_game_max_us = std::max(perf_game_max_us, game_work_us);
             perf_swap_total_us += swap_us;
             perf_swap_max_us = std::max(perf_swap_max_us, swap_us);
             ++perf_game_frames;
 
-            if (perf_game_frames >= 10) {
+            if (perf_game_frames >= 30) {
                 char marker[320];
                 sceClibSnprintf(
                     marker,
                     sizeof(marker),
                     "frame_perf frames=%u avg_loop_us=%llu max_loop_us=%llu "
-                    "avg_vblank_us=%llu max_vblank_us=%llu avg_game_us=%llu max_game_us=%llu "
+                    "avg_game_us=%llu max_game_us=%llu "
                     "avg_swap_us=%llu max_swap_us=%llu",
                     perf_game_frames,
                     static_cast<unsigned long long>(perf_loop_total_us / perf_game_frames),
                     static_cast<unsigned long long>(perf_loop_max_us),
-                    static_cast<unsigned long long>(perf_vblank_total_us / perf_game_frames),
-                    static_cast<unsigned long long>(perf_vblank_max_us),
                     static_cast<unsigned long long>(perf_game_total_us / perf_game_frames),
                     static_cast<unsigned long long>(perf_game_max_us),
                     static_cast<unsigned long long>(perf_swap_total_us / perf_game_frames),
@@ -309,13 +325,16 @@ int main() {
                 perf_game_frames = 0;
                 perf_loop_total_us = 0;
                 perf_loop_max_us = 0;
-                perf_vblank_total_us = 0;
-                perf_vblank_max_us = 0;
                 perf_game_total_us = 0;
                 perf_game_max_us = 0;
                 perf_swap_total_us = 0;
                 perf_swap_max_us = 0;
             }
+        } else {
+            perf_game_frames = 0;
+            perf_loop_total_us = perf_loop_max_us = 0;
+            perf_game_total_us = perf_game_max_us = 0;
+            perf_swap_total_us = perf_swap_max_us = 0;
         }
         ++frame;
     }

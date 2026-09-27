@@ -20,7 +20,7 @@ use std::borrow::Cow;
 use std::ffi::c_void;
 use std::fmt::{Debug, Formatter};
 use std::num::NonZeroU32;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use swf::{Color, ColorTransform};
@@ -66,6 +66,14 @@ unsafe extern "C" {
     fn flashvita_vitagl_draw_colored_line_strip(vertices: *const VitaVertex, vertex_count: usize);
     fn flashvita_vitagl_create_texture(data: *const u8, width: u32, height: u32) -> u32;
     fn flashvita_vitagl_update_texture(texture: u32, data: *const u8, width: u32, height: u32);
+    fn flashvita_vitagl_update_texture_region(
+        texture: u32,
+        data: *const u8,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+    );
     fn flashvita_vitagl_delete_texture(texture: u32);
     fn flashvita_vitagl_draw_textured_triangles(
         texture: u32,
@@ -325,6 +333,8 @@ static STAT_FRAMES: AtomicU64 = AtomicU64::new(0);
 static STAT_COLORED_DRAWS: AtomicU64 = AtomicU64::new(0);
 static STAT_TEXTURED_DRAWS: AtomicU64 = AtomicU64::new(0);
 static STAT_BITMAP_UPLOADS: AtomicU64 = AtomicU64::new(0);
+static STAT_BITMAP_PARTIAL_UPLOADS: AtomicU64 = AtomicU64::new(0);
+static STAT_BITMAP_UPLOADED_BYTES: AtomicU64 = AtomicU64::new(0);
 static STAT_LINES: AtomicU64 = AtomicU64::new(0);
 static STAT_GRADIENT_SKIPS: AtomicU64 = AtomicU64::new(0);
 static STAT_MISSING_BITMAPS: AtomicU64 = AtomicU64::new(0);
@@ -345,6 +355,8 @@ pub struct RendererStatsSnapshot {
     pub colored_draws: u64,
     pub textured_draws: u64,
     pub bitmap_uploads: u64,
+    pub bitmap_partial_uploads: u64,
+    pub bitmap_uploaded_bytes: u64,
     pub lines: u64,
     pub gradient_skips: u64,
     pub missing_bitmaps: u64,
@@ -366,6 +378,8 @@ pub fn renderer_stats_snapshot() -> RendererStatsSnapshot {
         colored_draws: STAT_COLORED_DRAWS.load(Ordering::Relaxed),
         textured_draws: STAT_TEXTURED_DRAWS.load(Ordering::Relaxed),
         bitmap_uploads: STAT_BITMAP_UPLOADS.load(Ordering::Relaxed),
+        bitmap_partial_uploads: STAT_BITMAP_PARTIAL_UPLOADS.load(Ordering::Relaxed),
+        bitmap_uploaded_bytes: STAT_BITMAP_UPLOADED_BYTES.load(Ordering::Relaxed),
         lines: STAT_LINES.load(Ordering::Relaxed),
         gradient_skips: STAT_GRADIENT_SKIPS.load(Ordering::Relaxed),
         missing_bitmaps: STAT_MISSING_BITMAPS.load(Ordering::Relaxed),
@@ -417,6 +431,7 @@ struct VitaBitmapHandle {
     texture: u32,
     width: u32,
     height: u32,
+    initialized: AtomicBool,
 }
 
 impl BitmapHandleImpl for VitaBitmapHandle {}
@@ -659,6 +674,7 @@ pub struct VitaRenderer {
     color_scratch: Vec<VitaVertex>,
     tex_scratch: Vec<VitaTexVertex>,
     color_index_scratch: Vec<u32>,
+    bitmap_upload_scratch: Vec<u8>,
     frame_batch: FrameShapeBatch,
 }
 
@@ -671,6 +687,7 @@ impl VitaRenderer {
             color_scratch: Vec::new(),
             tex_scratch: Vec::new(),
             color_index_scratch: Vec::new(),
+            bitmap_upload_scratch: Vec::new(),
             frame_batch: FrameShapeBatch::default(),
         }
     }
@@ -728,6 +745,30 @@ fn premultiplied_rgba<'a>(bitmap: Bitmap<'a>) -> (u32, u32, Cow<'a, [u8]>) {
     let height = bitmap.height();
     let bitmap = bitmap.to_rgba();
     (width, height, bitmap.into_buf())
+}
+
+fn pack_rgba_region(source: &[u8], source_width: u32, region: PixelRegion, out: &mut Vec<u8>) {
+    let row_bytes = region.width() as usize * 4;
+    let source_stride = source_width as usize * 4;
+    out.clear();
+    out.reserve(row_bytes * region.height() as usize);
+    for y in region.y_min..region.y_max {
+        let start = y as usize * source_stride + region.x_min as usize * 4;
+        out.extend_from_slice(&source[start..start + row_bytes]);
+    }
+}
+
+#[cfg(test)]
+mod bitmap_region_tests {
+    use super::*;
+
+    #[test]
+    fn packs_only_selected_rows_and_columns() {
+        let source: Vec<u8> = (0..4 * 3 * 4).collect();
+        let mut packed = vec![255; 64];
+        pack_rgba_region(&source, 4, PixelRegion::for_region(1, 1, 2, 2), &mut packed);
+        assert_eq!(packed, [&source[20..28], &source[36..44]].concat());
+    }
 }
 
 fn texture_from_handle(handle: &BitmapHandle) -> Option<&VitaBitmapHandle> {
@@ -865,6 +906,7 @@ fn create_gradient_texture(gradient: &TessGradient) -> Option<VitaGradientTextur
         return None;
     }
     STAT_BITMAP_UPLOADS.fetch_add(1, Ordering::Relaxed);
+    STAT_BITMAP_UPLOADED_BYTES.fetch_add(pixels.len() as u64, Ordering::Relaxed);
     let wrap_mode = match gradient.repeat_mode {
         swf::GradientSpread::Pad => 0,
         swf::GradientSpread::Repeat => 1,
@@ -1106,33 +1148,6 @@ impl<'a> VitaCommandHandler<'a> {
 }
 
 impl VitaCommandHandler<'_> {
-    fn draw_mesh(&mut self, mesh: &Mesh, transform: &Transform) {
-        for draw in &mesh.draws {
-            match &draw.draw_type {
-                DrawType::Color => {
-                    self.prepare_color_vertices(&draw.vertices, transform);
-                    let index_count = self.index_count(draw);
-                    unsafe {
-                        flashvita_vitagl_draw_colored_triangles(
-                            self.color_scratch.as_ptr(),
-                            self.color_scratch.len(),
-                            draw.indices.as_ptr(),
-                            index_count,
-                        );
-                    }
-                    STAT_COLORED_DRAWS.fetch_add(1, Ordering::Relaxed);
-                }
-                DrawType::Gradient { .. } => {
-                    STAT_GRADIENT_SKIPS.fetch_add(1, Ordering::Relaxed);
-                }
-                DrawType::Bitmap(_) => {
-                    // Bitmap fills need the shape's character-id -> texture mapping;
-                    // handled by draw_shape_mesh below.
-                }
-            }
-        }
-    }
-
     fn draw_shape_mesh(&mut self, shape: &VitaShapeHandle, transform: &Transform) {
         for draw in &shape.mesh.draws {
             match &draw.draw_type {
@@ -1496,12 +1511,15 @@ impl RenderBackend for VitaRenderer {
         _cache_entries: Vec<BitmapCacheEntry>,
     ) {
         STAT_FRAMES.fetch_add(1, Ordering::Relaxed);
-        let prepass_begin = Instant::now();
+        let profiling = crate::perf_logging_enabled();
+        let prepass_begin = profiling.then(Instant::now);
         self.frame_batch.prepare(&commands);
         self.frame_batch.execute();
-        STAT_PREPASS_US.fetch_add(prepass_begin.elapsed().as_micros() as u64, Ordering::Relaxed);
+        if let Some(begin) = prepass_begin {
+            STAT_PREPASS_US.fetch_add(begin.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
 
-        let submit_begin = Instant::now();
+        let submit_begin = profiling.then(Instant::now);
         unsafe { flashvita_vitagl_begin_flash_frame(clear.r, clear.g, clear.b, clear.a) };
         let mut handler = VitaCommandHandler::new(
             &mut self.color_scratch,
@@ -1512,7 +1530,9 @@ impl RenderBackend for VitaRenderer {
         );
         commands.execute(&mut handler);
         handler.flush_color_batch();
-        STAT_SUBMIT_US.fetch_add(submit_begin.elapsed().as_micros() as u64, Ordering::Relaxed);
+        if let Some(begin) = submit_begin {
+            STAT_SUBMIT_US.fetch_add(begin.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
     }
 
     fn create_empty_texture(
@@ -1531,6 +1551,7 @@ impl RenderBackend for VitaRenderer {
             texture,
             width: width.get(),
             height: height.get(),
+            initialized: AtomicBool::new(false),
         })))
     }
 
@@ -1541,10 +1562,12 @@ impl RenderBackend for VitaRenderer {
             return Err(Error::Unimplemented("vitaGL bitmap upload failed".into()));
         }
         STAT_BITMAP_UPLOADS.fetch_add(1, Ordering::Relaxed);
+        STAT_BITMAP_UPLOADED_BYTES.fetch_add(pixels.len() as u64, Ordering::Relaxed);
         Ok(BitmapHandle(Arc::new(VitaBitmapHandle {
             texture,
             width,
             height,
+            initialized: AtomicBool::new(true),
         })))
     }
 
@@ -1552,7 +1575,7 @@ impl RenderBackend for VitaRenderer {
         &mut self,
         handle: &BitmapHandle,
         bitmap: Bitmap<'_>,
-        _region: PixelRegion,
+        mut region: PixelRegion,
     ) -> Result<(), Error> {
         let Some(texture) = texture_from_handle(handle) else {
             return Err(Error::Unimplemented("invalid FlashVita bitmap handle".into()));
@@ -1561,7 +1584,37 @@ impl RenderBackend for VitaRenderer {
         if width != texture.width || height != texture.height {
             return Err(Error::Unimplemented("FlashVita bitmap resize is not supported yet".into()));
         }
-        unsafe { flashvita_vitagl_update_texture(texture.texture, pixels.as_ptr(), width, height) };
+        region.clamp(width, height);
+        if region.is_empty() {
+            return Ok(());
+        }
+
+        let changed_area = region.width() as u64 * region.height() as u64;
+        let whole_area = width as u64 * height as u64;
+        if texture.initialized.load(Ordering::Relaxed) && changed_area < whole_area / 2 {
+            pack_rgba_region(&pixels, width, region, &mut self.bitmap_upload_scratch);
+            unsafe {
+                flashvita_vitagl_update_texture_region(
+                    texture.texture,
+                    self.bitmap_upload_scratch.as_ptr(),
+                    region.x_min,
+                    region.y_min,
+                    region.width(),
+                    region.height(),
+                );
+            }
+            STAT_BITMAP_PARTIAL_UPLOADS.fetch_add(1, Ordering::Relaxed);
+            STAT_BITMAP_UPLOADED_BYTES.fetch_add(
+                self.bitmap_upload_scratch.len() as u64,
+                Ordering::Relaxed,
+            );
+        } else {
+            unsafe {
+                flashvita_vitagl_update_texture(texture.texture, pixels.as_ptr(), width, height)
+            };
+            STAT_BITMAP_UPLOADED_BYTES.fetch_add(pixels.len() as u64, Ordering::Relaxed);
+            texture.initialized.store(true, Ordering::Relaxed);
+        }
         STAT_BITMAP_UPLOADS.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }

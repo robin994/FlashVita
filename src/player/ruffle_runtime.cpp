@@ -1,4 +1,5 @@
 #include "ruffle_runtime.h"
+#include "vitagl_bridge.h"
 
 #include <algorithm>
 #include <cctype>
@@ -19,24 +20,6 @@
 
 #if FLASHVITA_ENABLE_RUFFLE
 namespace {
-bool g_flash_texture_enabled = false;
-bool g_flash_texcoord_array = false;
-bool g_flash_color_array = false;
-bool g_flash_premultiplied_blend = false;
-GLuint g_flash_bound_texture = 0;
-int g_flash_filter = -1;
-int g_flash_wrap = -1;
-
-void invalidateFlashGlCache() {
-    g_flash_texture_enabled = false;
-    g_flash_texcoord_array = false;
-    g_flash_color_array = false;
-    g_flash_premultiplied_blend = false;
-    g_flash_bound_texture = 0;
-    g_flash_filter = -1;
-    g_flash_wrap = -1;
-}
-
 void logMemoryStats(const char* stage) {
     const struct mallinfo heap = mallinfo();
     char line[512];
@@ -80,31 +63,13 @@ struct FlashVitaRuffleProbe {
     float frame_rate;
 };
 
-struct FlashVitaRuffleVertex {
-    float x;
-    float y;
-    uint8_t r;
-    uint8_t g;
-    uint8_t b;
-    uint8_t a;
-};
-
-struct FlashVitaRuffleTexVertex {
-    float x;
-    float y;
-    float u;
-    float v;
-    uint8_t r;
-    uint8_t g;
-    uint8_t b;
-    uint8_t a;
-};
-
 struct FlashVitaRendererStats {
     uint64_t frames;
     uint64_t colored_draws;
     uint64_t textured_draws;
     uint64_t bitmap_uploads;
+    uint64_t bitmap_partial_uploads;
+    uint64_t bitmap_uploaded_bytes;
     uint64_t lines;
     uint64_t gradient_skips;
     uint64_t missing_bitmaps;
@@ -141,238 +106,13 @@ int32_t flashvita_ruffle_headless_render(void* handle);
 int32_t flashvita_ruffle_key_event(void* handle, int32_t key, uint8_t down);
 int32_t flashvita_ruffle_mouse_move(void* handle, double x, double y);
 int32_t flashvita_ruffle_mouse_button(void* handle, double x, double y, uint8_t down);
+int32_t flashvita_ruffle_mouse_leave(void* handle);
 int32_t flashvita_ruffle_text_input_info(void* handle, FlashVitaTextInputInfo* out,
                                         uint8_t* initial_text, size_t initial_text_capacity);
 int32_t flashvita_ruffle_virtual_keyboard_ack(void* handle);
 int32_t flashvita_ruffle_replace_focused_text(void* handle, const uint8_t* data, size_t len);
 void flashvita_ruffle_headless_destroy(void* handle);
 int32_t flashvita_ruffle_renderer_stats(FlashVitaRendererStats* out);
-
-void flashvita_vitagl_begin_flash_frame(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
-    glViewport(0, 0, 960, 544);
-    glMatrixMode(GL_PROJECTION);
-    glLoadIdentity();
-    glOrtho(0, 960, 544, 0, -1, 1);
-    glMatrixMode(GL_MODELVIEW);
-    glLoadIdentity();
-    glDisable(GL_DEPTH_TEST);
-    glDisable(GL_CULL_FACE);
-    glDisable(GL_STENCIL_TEST);
-    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-    glStencilMask(0xFF);
-    glClearStencil(0);
-    glDisable(GL_TEXTURE_2D);
-    glEnableClientState(GL_VERTEX_ARRAY);
-    glDisableClientState(GL_TEXTURE_COORD_ARRAY);
-    glDisableClientState(GL_COLOR_ARRAY);
-    invalidateFlashGlCache();
-    glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    glClearColor(r / 255.0f, g / 255.0f, b / 255.0f, a / 255.0f);
-    glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
-}
-
-void flashvita_vitagl_prepare_ui() {
-    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-    glDisable(GL_STENCIL_TEST);
-    glStencilMask(0xFF);
-    glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
-    glDisable(GL_DEPTH_TEST);
-    glDisable(GL_CULL_FACE);
-    glDisable(GL_TEXTURE_2D);
-    glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    glEnableClientState(GL_VERTEX_ARRAY);
-    glDisableClientState(GL_TEXTURE_COORD_ARRAY);
-    glDisableClientState(GL_COLOR_ARRAY);
-    invalidateFlashGlCache();
-}
-
-void flashvita_vitagl_mask_push(uint32_t previous_depth) {
-    glEnable(GL_STENCIL_TEST);
-    glStencilMask(0xFF);
-    glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
-    glStencilFunc(GL_EQUAL, static_cast<GLint>(previous_depth), 0xFF);
-    glStencilOp(GL_KEEP, GL_KEEP, GL_INCR);
-}
-
-void flashvita_vitagl_mask_activate(uint32_t depth) {
-    glEnable(GL_STENCIL_TEST);
-    glStencilMask(0x00);
-    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-    glStencilFunc(GL_EQUAL, static_cast<GLint>(depth), 0xFF);
-    glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
-}
-
-void flashvita_vitagl_mask_deactivate(uint32_t depth) {
-    glEnable(GL_STENCIL_TEST);
-    glStencilMask(0xFF);
-    glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
-    glStencilFunc(GL_EQUAL, static_cast<GLint>(depth), 0xFF);
-    glStencilOp(GL_KEEP, GL_KEEP, GL_DECR);
-}
-
-void flashvita_vitagl_mask_pop(uint32_t depth) {
-    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-    if (depth == 0) {
-        glDisable(GL_STENCIL_TEST);
-        glStencilMask(0xFF);
-        glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
-    } else {
-        glEnable(GL_STENCIL_TEST);
-        glStencilMask(0x00);
-        glStencilFunc(GL_EQUAL, static_cast<GLint>(depth), 0xFF);
-        glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
-    }
-}
-
-void flashvita_vitagl_draw_colored_triangles(const FlashVitaRuffleVertex* vertices,
-                                              size_t vertex_count,
-                                              const uint32_t* indices,
-                                              size_t index_count) {
-    if (!vertices || !indices || vertex_count == 0 || index_count < 3) return;
-    if (g_flash_premultiplied_blend) {
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-        g_flash_premultiplied_blend = false;
-    }
-
-    if (g_flash_texture_enabled) {
-        glDisable(GL_TEXTURE_2D);
-        g_flash_texture_enabled = false;
-    }
-    if (g_flash_texcoord_array) {
-        glDisableClientState(GL_TEXTURE_COORD_ARRAY);
-        g_flash_texcoord_array = false;
-    }
-    if (!g_flash_color_array) {
-        glEnableClientState(GL_COLOR_ARRAY);
-        g_flash_color_array = true;
-    }
-    glVertexPointer(2, GL_FLOAT, sizeof(FlashVitaRuffleVertex), &vertices[0].x);
-    glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(FlashVitaRuffleVertex), &vertices[0].r);
-    glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(index_count), GL_UNSIGNED_INT, indices);
-}
-
-void flashvita_vitagl_draw_colored_line_strip(const FlashVitaRuffleVertex* vertices,
-                                              size_t vertex_count) {
-    if (!vertices || vertex_count < 2) return;
-    if (g_flash_premultiplied_blend) {
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-        g_flash_premultiplied_blend = false;
-    }
-    if (g_flash_texture_enabled) {
-        glDisable(GL_TEXTURE_2D);
-        g_flash_texture_enabled = false;
-    }
-    if (g_flash_texcoord_array) {
-        glDisableClientState(GL_TEXTURE_COORD_ARRAY);
-        g_flash_texcoord_array = false;
-    }
-    if (!g_flash_color_array) {
-        glEnableClientState(GL_COLOR_ARRAY);
-        g_flash_color_array = true;
-    }
-    glVertexPointer(2, GL_FLOAT, sizeof(FlashVitaRuffleVertex), &vertices[0].x);
-    glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(FlashVitaRuffleVertex), &vertices[0].r);
-    glDrawArrays(GL_LINE_STRIP, 0, static_cast<GLsizei>(vertex_count));
-}
-
-uint32_t flashvita_vitagl_create_texture(const uint8_t* data, uint32_t width, uint32_t height) {
-    if (width == 0 || height == 0) return 0;
-    GLuint texture = 0;
-    glGenTextures(1, &texture);
-    if (!texture) return 0;
-    glBindTexture(GL_TEXTURE_2D, texture);
-    g_flash_bound_texture = texture;
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    g_flash_filter = 1;
-    g_flash_wrap = 0;
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, static_cast<GLsizei>(width),
-                 static_cast<GLsizei>(height), 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
-    if (glGetError() != GL_NO_ERROR) {
-        glDeleteTextures(1, &texture);
-        return 0;
-    }
-    return texture;
-}
-
-void flashvita_vitagl_update_texture(uint32_t texture, const uint8_t* data,
-                                     uint32_t width, uint32_t height) {
-    if (!texture || !data || width == 0 || height == 0) return;
-    if (g_flash_bound_texture != texture) {
-        glBindTexture(GL_TEXTURE_2D, texture);
-        g_flash_bound_texture = texture;
-        g_flash_filter = -1;
-        g_flash_wrap = -1;
-    }
-    // Ruffle currently hands us the complete bitmap even when only a dirty region changed.
-    // A full re-upload is correct and keeps the first Vita backend simple; optimize later.
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, static_cast<GLsizei>(width),
-                 static_cast<GLsizei>(height), 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
-}
-
-void flashvita_vitagl_delete_texture(uint32_t texture) {
-    if (!texture) return;
-    const GLuint id = texture;
-    glDeleteTextures(1, &id);
-    if (g_flash_bound_texture == texture) {
-        g_flash_bound_texture = 0;
-        g_flash_filter = -1;
-        g_flash_wrap = -1;
-    }
-}
-
-void flashvita_vitagl_draw_textured_triangles(uint32_t texture,
-                                              const FlashVitaRuffleTexVertex* vertices,
-                                              size_t vertex_count,
-                                              const uint32_t* indices,
-                                              size_t index_count,
-                                              uint8_t smoothing,
-    uint8_t wrap_mode) {
-    if (!texture || !vertices || !indices || vertex_count == 0 || index_count < 3) return;
-    if (!g_flash_premultiplied_blend) {
-        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-        g_flash_premultiplied_blend = true;
-    }
-    if (!g_flash_texture_enabled) {
-        glEnable(GL_TEXTURE_2D);
-        g_flash_texture_enabled = true;
-    }
-    if (g_flash_bound_texture != texture) {
-        glBindTexture(GL_TEXTURE_2D, texture);
-        g_flash_bound_texture = texture;
-        g_flash_filter = -1;
-        g_flash_wrap = -1;
-    }
-    const int filter = smoothing ? 1 : 0;
-    if (g_flash_filter != filter) {
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, smoothing ? GL_LINEAR : GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, smoothing ? GL_LINEAR : GL_NEAREST);
-        g_flash_filter = filter;
-    }
-    const GLint wrap = wrap_mode == 2 ? GL_MIRRORED_REPEAT
-                                      : (wrap_mode == 1 ? GL_REPEAT : GL_CLAMP_TO_EDGE);
-    if (g_flash_wrap != static_cast<int>(wrap_mode)) {
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrap);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrap);
-        g_flash_wrap = static_cast<int>(wrap_mode);
-    }
-    if (!g_flash_texcoord_array) {
-        glEnableClientState(GL_TEXTURE_COORD_ARRAY);
-        g_flash_texcoord_array = true;
-    }
-    if (!g_flash_color_array) {
-        glEnableClientState(GL_COLOR_ARRAY);
-        g_flash_color_array = true;
-    }
-    glVertexPointer(2, GL_FLOAT, sizeof(FlashVitaRuffleTexVertex), &vertices[0].x);
-    glTexCoordPointer(2, GL_FLOAT, sizeof(FlashVitaRuffleTexVertex), &vertices[0].u);
-    glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(FlashVitaRuffleTexVertex), &vertices[0].r);
-    glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(index_count), GL_UNSIGNED_INT, indices);
-}
 }
 #endif
 
@@ -586,6 +326,7 @@ void copyProbe(const FlashVitaRuffleProbe& src, RuffleProbeInfo& dst) {
 }
 
 void logRendererStats(const char* reason) {
+    if (!vita::perfLoggingEnabled()) return;
     FlashVitaRendererStats stats{};
     if (flashvita_ruffle_renderer_stats(&stats) != 0) return;
     static uint64_t previous_worker_clocks[2]{};
@@ -602,11 +343,12 @@ void logRendererStats(const char* reason) {
     previous_worker_clocks[0] = worker_stats.run_clocks[0];
     previous_worker_clocks[1] = worker_stats.run_clocks[1];
 
-    char line[704];
+    char line[768];
     const int length = sceClibSnprintf(
         line,
         sizeof(line),
         "ruffle_renderer reason=%s frames=%llu color=%llu textured=%llu uploads=%llu "
+        "partial_uploads=%llu uploaded_bytes=%llu "
         "lines=%llu gradient_skip=%llu missing_bitmap=%llu mask_ops=%llu blends=%llu stage3d=%llu "
         "xform_vertices=%llu parallel_draws=%llu parallel_batches=%llu parallel_jobs=%llu "
         "color_submissions=%llu prepass_us=%llu submit_us=%llu "
@@ -616,6 +358,8 @@ void logRendererStats(const char* reason) {
         static_cast<unsigned long long>(stats.colored_draws),
         static_cast<unsigned long long>(stats.textured_draws),
         static_cast<unsigned long long>(stats.bitmap_uploads),
+        static_cast<unsigned long long>(stats.bitmap_partial_uploads),
+        static_cast<unsigned long long>(stats.bitmap_uploaded_bytes),
         static_cast<unsigned long long>(stats.lines),
         static_cast<unsigned long long>(stats.gradient_skips),
         static_cast<unsigned long long>(stats.missing_bitmaps),
@@ -650,7 +394,7 @@ uint64_t visibleRendererDrawCount() {
 void logRuntimePerf(uint32_t ticks, uint32_t rendered,
                     uint64_t update_total_us, uint64_t update_max_us,
                     uint64_t render_total_us, uint64_t render_max_us) {
-    if (ticks == 0) return;
+    if (ticks == 0 || !vita::perfLoggingEnabled()) return;
     const uint64_t total_us = update_total_us + render_total_us;
     const uint64_t max_total_us = update_max_us + render_max_us;
     char line[384];
@@ -902,32 +646,40 @@ bool RuffleRuntime::tick(double dt_ms) {
 #if FLASHVITA_ENABLE_RUFFLE
     if (!handle_) return false;
     updateVirtualKeyboard();
+    const bool profile = vita::perfLoggingEnabled();
 
     uint64_t update_us = 0;
     uint64_t render_us = 0;
     int32_t result = 1;
 
     if (!ime_active_) {
-        const uint64_t update_begin_us = sceKernelGetProcessTimeWide();
+        const uint64_t update_begin_us = profile ? sceKernelGetProcessTimeWide() : 0;
         result = flashvita_ruffle_headless_update(handle_, dt_ms);
-        update_us = sceKernelGetProcessTimeWide() - update_begin_us;
+        if (profile) update_us = sceKernelGetProcessTimeWide() - update_begin_us;
         if (result < 0) return false;
     }
 
-    const uint64_t render_begin_us = sceKernelGetProcessTimeWide();
+    const uint64_t render_begin_us = profile ? sceKernelGetProcessTimeWide() : 0;
     result = flashvita_ruffle_headless_render(handle_);
-    render_us = sceKernelGetProcessTimeWide() - render_begin_us;
+    if (profile) render_us = sceKernelGetProcessTimeWide() - render_begin_us;
     if (result < 0) return false;
 
     rendered_last_tick_ = result > 0;
     ++tick_counter_;
+    if (!profile) {
+        perf_ticks_ = 0;
+        perf_rendered_ = 0;
+        perf_update_total_us_ = perf_update_max_us_ = 0;
+        perf_render_total_us_ = perf_render_max_us_ = 0;
+        return true;
+    }
     perf_update_total_us_ += update_us;
     if (update_us > perf_update_max_us_) perf_update_max_us_ = update_us;
     perf_render_total_us_ += render_us;
     if (render_us > perf_render_max_us_) perf_render_max_us_ = render_us;
     ++perf_ticks_;
     if (rendered_last_tick_) ++perf_rendered_;
-    if (perf_ticks_ >= 10) {
+    if (perf_ticks_ >= 30) {
         logRuntimePerf(perf_ticks_, perf_rendered_,
                        perf_update_total_us_, perf_update_max_us_,
                        perf_render_total_us_, perf_render_max_us_);
@@ -938,7 +690,7 @@ bool RuffleRuntime::tick(double dt_ms) {
         perf_ticks_ = 0;
         perf_rendered_ = 0;
     }
-    if (tick_counter_ == 1 || (tick_counter_ % 10) == 0) {
+    if (tick_counter_ == 1 || (vita::perfLoggingEnabled() && (tick_counter_ % 30) == 0)) {
         logRendererStats(tick_counter_ == 1 ? "first_frame" : "periodic");
     }
     return true;
@@ -979,6 +731,14 @@ bool RuffleRuntime::mouseButton(double x, double y, bool down) {
 #endif
 }
 
+bool RuffleRuntime::mouseLeave() {
+#if FLASHVITA_ENABLE_RUFFLE
+    return handle_ && flashvita_ruffle_mouse_leave(handle_) == 0;
+#else
+    return false;
+#endif
+}
+
 void RuffleRuntime::stop() {
 #if FLASHVITA_ENABLE_RUFFLE
     closeVirtualKeyboard();
@@ -989,7 +749,7 @@ void RuffleRuntime::stop() {
         glFinish();
         flashvita_ruffle_headless_destroy(handle_);
         handle_ = nullptr;
-        invalidateFlashGlCache();
+        flashvita_vitagl_invalidate_cache();
         glFinish();
 
         const int trimmed = malloc_trim(0);

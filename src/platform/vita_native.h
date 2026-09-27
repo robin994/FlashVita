@@ -31,6 +31,8 @@ bool makeDirectories(const std::string& path);
 bool fileExists(const std::string& path);
 void setLoggingEnabled(bool enabled);
 bool loggingEnabled();
+void setPerfLoggingEnabled(bool enabled);
+bool perfLoggingEnabled();
 
 } // namespace flashvita::vita
 
@@ -71,4 +73,5 @@ int32_t flashvita_vita_http_fetch_to_file(const char* url,
                                           int32_t* http_status);
 void flashvita_vita_log_line(const char* line);
 int32_t flashvita_vita_logging_enabled(void);
+int32_t flashvita_vita_perf_logging_enabled(void);
 }

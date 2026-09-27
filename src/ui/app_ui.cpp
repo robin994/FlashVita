@@ -184,8 +184,13 @@ void AppUi::drawSettings() {
     if (old_logs != config_.enable_logs) {
         vita::setLoggingEnabled(config_.enable_logs);
     }
+    const bool old_perf_logs = config_.enable_perf_logs;
+    ImGui::Checkbox("Enable performance profiling", &config_.enable_perf_logs);
+    if (old_perf_logs != config_.enable_perf_logs) {
+        vita::setPerfLoggingEnabled(config_.enable_perf_logs);
+    }
     ImGui::SameLine();
-    ImGui::TextDisabled("Disable for lower I/O overhead and better runtime performance");
+    ImGui::TextDisabled("Requires runtime logs; writes timing samples to runtime.log");
 
     ImGui::Spacing();
     ImGui::Text("Storage");

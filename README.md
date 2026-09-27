@@ -13,12 +13,13 @@ The native Vita shell is hardware-verified. Runtime integration is now based on 
 - Per-game Vita button mappings saved under `ux0:data/FlashVita/profiles/`.
 - Configurable analog-stick and touch mouse emulation flags.
 - Global settings persisted to `ux0:data/FlashVita/config.ini`.
-- Runtime/player interface isolated from the UI so an AVM1/AVM2 implementation can be integrated without redesigning the frontend.
+- Runtime/player interface isolated from the UI, with AVM1/AVM2 handled by Ruffle.
 - Ruffle 0.6.0 vendored under `third_party/ruffle`.
 - C ABI bridge between the Vita C++ frontend and the Rust Ruffle player.
 - Ruffle headless `PlayerBuilder` path with null desktop services and a custom Vita renderer hook.
 - First Ruffle -> vitaGL renderer path using Ruffle/Lyon CPU tessellation for solid-color vector triangles.
 - Vita controls, analog mouse and touch translated to Ruffle `PlayerEvent` input events.
+- Native Vita audio backend and file/network adapters for the Ruffle runtime.
 
 ## Runtime controls
 
@@ -48,9 +49,15 @@ ux0:data/FlashVita/
 
 Copy `.swf` games into `ux0:data/FlashVita/games/` and press **Refresh** in the library.
 
-## Building the native shell
+## Building FlashVita
 
-Requires VitaSDK with vitaGL and imgui-vita installed.
+Requires VitaSDK with vitaGL and imgui-vita installed. Initialize the Ruffle
+submodule and install a current nightly Rust compiler with `rust-src`:
+
+```sh
+git submodule update --init third_party/ruffle
+rustup toolchain install nightly --component rust-src
+```
 
 ```sh
 make -j4
@@ -60,30 +67,47 @@ make verify
 The VPK is generated at:
 
 ```text
-build/FlashVita.vpk
+build/ruffle/FlashVita.vpk
 ```
 
-This default build uses `ENABLE_RUFFLE=0`, so it does not require a Rust toolchain and is useful for frontend/regression work.
-
-## Building with Ruffle
-
-Ruffle 0.6.0 uses Rust edition 2024. PS Vita is a Tier-3 Rust target with `std`, so the Vita build needs a current nightly compiler and `rust-src`; `cargo-vita` is also used for Vita-Rust tooling.
-
-One-time host setup:
+The default build includes Ruffle. Ruffle 0.6.0 uses Rust edition 2024; PS Vita
+is a Tier-3 Rust target with `std`. `cargo-vita` is used by the optional toolchain check:
 
 ```sh
-rustup toolchain install nightly --component rust-src
 cargo +nightly install cargo-vita
+make ruffle-check
 ```
 
-Then verify and build:
+## Building the frontend shell
+
+The shell build omits Ruffle and needs only the Vita C++ toolchain. It is useful
+for UI and parser regression work:
 
 ```sh
-make ruffle-check
-make ENABLE_RUFFLE=1 clean verify
+make ENABLE_RUFFLE=0 verify
 ```
 
-The Ruffle static library target is `armv7-sony-vita-newlibeabihf` and is linked into the same native FlashVita VPK.
+Its VPK is written to `build/shell/FlashVita.vpk`. Each build mode has
+its own object and package directory, so switching `ENABLE_RUFFLE` does not reuse the
+other mode's output. Use `BUILD_ROOT=/path/to/output` to change the output root.
+`VITAGL_DIR`, `IMGUI_VITA_DIR`, and `RUFFLE_TARGET_DIR` can be overridden for local toolchains.
+Cargo output defaults to ignored `build/cargo-target` to avoid changing the
+previously tracked Rust build artifacts in the repository.
+
+Run the host parser test with `make -f tests/HostTest.mk test`.
+
+The Settings screen can enable detailed performance profiling. It is off by default and
+requires runtime logs to be enabled. Profiling writes 30-frame timing windows to
+`ux0:data/FlashVita/runtime.log`, including renderer upload counts and bytes.
+
+FlashVita links a prebuilt vitaGL archive from `VITAGL_DIR`. vitaGL make flags are
+chosen when that archive is built, not when FlashVita is built. Keep the archive's
+source revision and build command alongside it when comparing performance.
+
+At startup FlashVita requests 444 MHz ARM, 222 MHz bus, 222 MHz GPU and
+166 MHz GPU crossbar clocks through VitaSDK. The requested and effective clocks
+and API results are written to `runtime.log` when logging is enabled. Higher
+clocks increase power use; device measurements should confirm their effect.
 
 ## Runtime roadmap
 

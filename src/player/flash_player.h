@@ -24,6 +24,7 @@ public:
     bool sendKey(FlashKey key, bool down) { return ruffle_.keyEvent(static_cast<int>(key), down); }
     bool sendMouseMove(double x, double y) { return ruffle_.mouseMove(x, y); }
     bool sendMouseButton(double x, double y, bool down) { return ruffle_.mouseButton(x, y, down); }
+    bool sendMouseLeave() { return ruffle_.mouseLeave(); }
 
 private:
     bool open_ = false;

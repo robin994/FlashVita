@@ -12,12 +12,13 @@ class RuntimeInput {
 public:
     void update(FlashPlayer& player, const InputProfile& profile, uint32_t blocked_buttons = 0);
     void suspend(FlashPlayer& player, const InputProfile& profile);
-    bool cursorVisible() const { return cursor_frames_ > 0; }
+    bool cursorVisible() const;
     float mouseX() const { return mouse_x_; }
     float mouseY() const { return mouse_y_; }
 
 private:
     void syncMouseButton(FlashPlayer& player);
+    void markPointerActivity();
 
     bool initialized_ = false;
     uint32_t previous_buttons_ = 0;
@@ -30,7 +31,8 @@ private:
     uint64_t last_rear_touch_timestamp_ = 0;
     float mouse_x_ = 480.0f;
     float mouse_y_ = 272.0f;
-    uint16_t cursor_frames_ = 0;
+    bool pointer_active_ = false;
+    uint64_t cursor_visible_until_us_ = 0;
 };
 
 } // namespace flashvita

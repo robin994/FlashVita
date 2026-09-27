@@ -6,17 +6,20 @@ CXX := $(PREFIX)-g++
 TARGET := FlashVita
 TITLE_ID := FLASHVITA
 TITLE_NAME := FlashVita
-BUILD_DIR := build
+BUILD_ROOT ?= build
 
-ENABLE_RUFFLE ?= 0
+ENABLE_RUFFLE ?= 1
+BUILD_VARIANT := $(if $(filter 1,$(ENABLE_RUFFLE)),ruffle,shell)
+BUILD_DIR := $(BUILD_ROOT)/$(BUILD_VARIANT)
 RUFFLE_BRIDGE_DIR := rust/ruffle_bridge
 RUFFLE_TARGET := armv7-sony-vita-newlibeabihf
-RUFFLE_LIB := $(RUFFLE_BRIDGE_DIR)/target/$(RUFFLE_TARGET)/release/libflashvita_ruffle_bridge.a
-RUFFLE_BRIDGE_SOURCES := $(wildcard $(RUFFLE_BRIDGE_DIR)/src/*.rs) $(RUFFLE_BRIDGE_DIR)/Cargo.toml
-RUFFLE_VENDOR_SOURCES := $(shell find third_party/ruffle/core/src third_party/ruffle/render/src third_party/ruffle/common/src third_party/ruffle/swf/src -type f -name '*.rs' 2>/dev/null)
+RUFFLE_TARGET_DIR ?= $(BUILD_ROOT)/cargo-target
+RUFFLE_LIB := $(RUFFLE_TARGET_DIR)/$(RUFFLE_TARGET)/release/libflashvita_ruffle_bridge.a
+RUFFLE_BRIDGE_SOURCES := $(wildcard $(RUFFLE_BRIDGE_DIR)/src/*.rs) $(RUFFLE_BRIDGE_DIR)/Cargo.toml $(RUFFLE_BRIDGE_DIR)/Cargo.lock
+RUFFLE_VENDOR_SOURCES := $(shell find third_party/ruffle -type f \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' \) 2>/dev/null)
 
-VITAGL_DIR := /Users/robin994/.local/opt/vitadb-deps/vitaGL-fresh
-IMGUI_VITA_DIR := /Users/robin994/.local/opt/vitadb-deps/imgui-vita-fresh
+VITAGL_DIR ?= /Users/robin994/.local/opt/vitadb-deps/vitaGL-fresh
+IMGUI_VITA_DIR ?= /Users/robin994/.local/opt/vitadb-deps/imgui-vita-fresh
 
 SOURCES := \
 	src/main.cpp \
@@ -27,6 +30,7 @@ SOURCES := \
 	src/input/runtime_input.cpp \
 	src/config/app_config.cpp \
 	src/player/flash_player.cpp \
+	src/player/vitagl_bridge.cpp \
 	src/player/ruffle_runtime.cpp \
 	src/player/swf_parser.cpp
 
@@ -62,9 +66,10 @@ LIBS := \
 	-lSceShaccCgExt \
 	-lmathneon \
 	-ltaihen_stub \
-		-lSceDisplay_stub \
-		-lSceAudio_stub \
-		-lSceGxm_stub \
+	-lSceDisplay_stub \
+	-lScePower_stub \
+	-lSceAudio_stub \
+	-lSceGxm_stub \
 	-lSceCommonDialog_stub \
 	-lSceIme_stub \
 	-lSceAppUtil_stub \
@@ -96,8 +101,9 @@ $(ELF): $(OBJECTS) $(RUFFLE_LINK_INPUT)
 	$(CXX) $(CXXFLAGS) $(OBJECTS) $(RUFFLE_LINK_INPUT) $(LDFLAGS) $(LIBS) -o $@
 
 $(RUFFLE_LIB): $(RUFFLE_BRIDGE_SOURCES) $(RUFFLE_VENDOR_SOURCES)
-	VITASDK=$(VITASDK) cargo +nightly build \
+	VITASDK=$(VITASDK) CARGO_TARGET_DIR=$(abspath $(RUFFLE_TARGET_DIR)) cargo +nightly build \
 		-Z build-std=std,panic_abort \
+		--locked \
 		--release \
 		--target $(RUFFLE_TARGET) \
 		--manifest-path $(RUFFLE_BRIDGE_DIR)/Cargo.toml
@@ -108,7 +114,7 @@ ruffle-check:
 	@cargo +nightly vita --version
 
 ruffle-host-check:
-	cargo +nightly check --release --manifest-path $(RUFFLE_BRIDGE_DIR)/Cargo.toml
+	CARGO_TARGET_DIR=$(abspath $(RUFFLE_TARGET_DIR)) cargo +nightly check --locked --release --manifest-path $(RUFFLE_BRIDGE_DIR)/Cargo.toml
 
 $(VELF): $(ELF)
 	vita-elf-create -s $< $@
