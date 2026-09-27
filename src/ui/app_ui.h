@@ -15,6 +15,9 @@ public:
 
     void draw();
     void applyTheme();
+    bool takeLaunchRequest(std::string& path);
+    bool launchLoading() const { return launch_loading_; }
+    void setLaunchLoading(bool loading) { launch_loading_ = loading; }
 
 private:
     enum class Screen {
@@ -39,6 +42,11 @@ private:
     Screen screen_ = Screen::Library;
     int selected_index_ = -1;
     std::string notification_;
+    bool launch_requested_ = false;
+    bool launch_loading_ = false;
+    bool launch_screen_presented_ = false;
+    std::string pending_launch_path_;
+    std::string pending_launch_name_;
 };
 
 } // namespace flashvita

@@ -1,9 +1,11 @@
 #include "swf_parser.h"
 
 #include <algorithm>
-#include <cstdio>
 #include <cstring>
+#include <new>
 #include <vector>
+
+#include "../platform/vita_native.h"
 #include <zlib.h>
 
 namespace flashvita {
@@ -78,19 +80,7 @@ uint32_t countAvm1Actions(const uint8_t* data, size_t size) {
 }
 
 bool readFile(const std::string& path, std::vector<uint8_t>& data) {
-    FILE* f = std::fopen(path.c_str(), "rb");
-    if (!f) return false;
-    std::fseek(f, 0, SEEK_END);
-    const long length = std::ftell(f);
-    std::fseek(f, 0, SEEK_SET);
-    if (length < 0 || static_cast<uint64_t>(length) > kMaxSwfSize) {
-        std::fclose(f);
-        return false;
-    }
-    data.resize(static_cast<size_t>(length));
-    const size_t read = data.empty() ? 0 : std::fread(data.data(), 1, data.size(), f);
-    std::fclose(f);
-    return read == data.size();
+    return vita::readFile(path, data, static_cast<size_t>(kMaxSwfSize));
 }
 
 } // namespace
@@ -98,11 +88,12 @@ bool readFile(const std::string& path, std::vector<uint8_t>& data) {
 bool SwfParser::parseFile(const std::string& path, SwfDocumentInfo& out) const {
     out = SwfDocumentInfo{};
 
-    std::vector<uint8_t> file;
-    if (!readFile(path, file)) {
-        out.error = "Unable to read SWF file";
-        return false;
-    }
+    try {
+        std::vector<uint8_t> file;
+        if (!readFile(path, file)) {
+            out.error = "Unable to read SWF file";
+            return false;
+        }
     if (file.size() < 8) {
         out.error = "SWF is smaller than the 8-byte header";
         return false;
@@ -227,8 +218,13 @@ bool SwfParser::parseFile(const std::string& path, SwfDocumentInfo& out) const {
         offset += length;
     }
 
-    out.valid = true;
-    return true;
+        out.valid = true;
+        return true;
+    } catch (const std::bad_alloc&) {
+        out = SwfDocumentInfo{};
+        out.error = "Not enough memory to parse this SWF";
+        return false;
+    }
 }
 
 } // namespace flashvita

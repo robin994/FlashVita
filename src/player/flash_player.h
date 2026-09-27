@@ -20,6 +20,7 @@ public:
     bool ruffleRunning() const { return ruffle_.running(); }
     bool tick(double dt_ms) { return ruffle_.tick(dt_ms); }
     bool renderedLastTick() const { return ruffle_.renderedLastTick(); }
+    bool virtualKeyboardActive() const { return ruffle_.virtualKeyboardActive(); }
     bool sendKey(FlashKey key, bool down) { return ruffle_.keyEvent(static_cast<int>(key), down); }
     bool sendMouseMove(double x, double y) { return ruffle_.mouseMove(x, y); }
     bool sendMouseButton(double x, double y, bool down) { return ruffle_.mouseButton(x, y, down); }

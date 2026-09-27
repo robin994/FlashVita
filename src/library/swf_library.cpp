@@ -2,10 +2,12 @@
 
 #include <algorithm>
 #include <cctype>
-#include <cstdio>
 #include <cstring>
-#include <dirent.h>
-#include <sys/stat.h>
+
+#include <psp2/io/dirent.h>
+#include <psp2/io/stat.h>
+
+#include "../platform/vita_native.h"
 
 namespace flashvita {
 namespace {
@@ -28,12 +30,9 @@ uint32_t readLe32(const unsigned char* p) {
 } // namespace
 
 bool SwfLibrary::inspectHeader(SwfInfo& game) {
-    FILE* f = std::fopen(game.path.c_str(), "rb");
-    if (!f) return false;
-
     unsigned char header[8] = {};
-    const size_t read = std::fread(header, 1, sizeof(header), f);
-    std::fclose(f);
+    size_t read = 0;
+    if (!vita::readFilePrefix(game.path, header, sizeof(header), read)) return false;
     if (read != sizeof(header)) return false;
 
     const bool fws = std::memcmp(header, "FWS", 3) == 0;
@@ -53,24 +52,29 @@ void SwfLibrary::scan(const std::string& root) {
     root_ = root;
     games_.clear();
 
-    DIR* dir = opendir(root.c_str());
-    if (!dir) return;
+    const SceUID dir = sceIoDopen(root.c_str());
+    if (dir < 0) return;
 
-    for (dirent* entry = readdir(dir); entry; entry = readdir(dir)) {
-        if (entry->d_name[0] == '.' || !hasSwfExtension(entry->d_name)) continue;
+    SceIoDirent entry{};
+    while (sceIoDread(dir, &entry) > 0) {
+        if (entry.d_name[0] == '.' || !hasSwfExtension(entry.d_name)) {
+            entry = SceIoDirent{};
+            continue;
+        }
 
         SwfInfo game;
-        game.name = entry->d_name;
+        game.name = entry.d_name;
         game.path = root;
         if (!game.path.empty() && game.path.back() != '/') game.path += '/';
-        game.path += entry->d_name;
+        game.path += entry.d_name;
 
-        struct stat st {};
-        if (stat(game.path.c_str(), &st) == 0) game.size = static_cast<uint64_t>(st.st_size);
+        SceIoStat st{};
+        if (sceIoGetstat(game.path.c_str(), &st) == 0) game.size = static_cast<uint64_t>(st.st_size);
         inspectHeader(game);
         games_.push_back(game);
+        entry = SceIoDirent{};
     }
-    closedir(dir);
+    sceIoDclose(dir);
 
     std::sort(games_.begin(), games_.end(), [](const SwfInfo& a, const SwfInfo& b) {
         std::string left = a.name;

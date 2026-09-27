@@ -41,7 +41,10 @@ enum class FlashKey {
     W,
     E,
     Shift,
-    Ctrl
+    Ctrl,
+    O,
+    P,
+    Backspace
 };
 
 struct InputProfile {
@@ -49,6 +52,7 @@ struct InputProfile {
     bool left_stick_mouse = true;
     bool front_touch_mouse = true;
     bool rear_touch_mouse = false;
+    bool cross_mouse_click = true;
     float mouse_speed = 1.0f;
 };
 

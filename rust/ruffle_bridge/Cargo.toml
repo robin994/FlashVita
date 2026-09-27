@@ -8,9 +8,13 @@ publish = false
 crate-type = ["staticlib"]
 
 [dependencies]
-ruffle_core = { path = "../../third_party/ruffle/core", default-features = false, features = ["lzma"] }
+ruffle_core = { path = "../../third_party/ruffle/core", default-features = false, features = ["audio", "mp3", "aac", "nellymoser", "lzma"] }
 ruffle_render = { path = "../../third_party/ruffle/render", default-features = false, features = ["tessellator"] }
 swf = { path = "../../third_party/ruffle/swf", default-features = true }
+url = "2"
+async-channel = "2"
+encoding_rs = "0.8"
+indexmap = "2"
 
 [profile.release]
 panic = "abort"

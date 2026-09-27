@@ -1,0 +1,1645 @@
+diff --git a/core/src/avm1/activation.rs b/core/src/avm1/activation.rs
+index ceac03a3..3c0e9b01 100644
+--- a/core/src/avm1/activation.rs
++++ b/core/src/avm1/activation.rs
+@@ -3,6 +3,8 @@ use crate::avm1::error::Error;
+ use crate::avm1::function::{Avm1Function, ExecutionReason, FunctionObject};
+ use crate::avm1::property::Attribute;
+ use crate::avm1::runtime::skip_actions;
++#[cfg(target_os = "vita")]
++use crate::avm1::runtime::VitaPushOperand;
+ use crate::avm1::scope::{Scope, ScopeClass};
+ use crate::avm1::{ArrayBuilder, Object, Value, fscommand, globals, scope};
+ use crate::backend::navigator::{NavigationMethod, Request};
+@@ -520,6 +522,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
+         reader: &mut Reader<'b>,
+     ) -> Result<FrameControl<'gc>, Error<'gc>> {
+         *self.context.actions_since_timeout_check += 1;
++        *self.context.avm1_action_count += 1;
+         if *self.context.actions_since_timeout_check >= 2000 {
+             *self.context.actions_since_timeout_check = 0;
+             if self.context.update_start.elapsed() >= self.context.max_execution_duration {
+@@ -531,7 +534,25 @@ impl<'a, 'gc> Activation<'a, 'gc> {
+             //Executing beyond the end of a function constitutes an implicit return.
+             Ok(FrameControl::Return(ReturnType::Implicit))
+         } else {
++            #[cfg(target_os = "vita")]
++            if let Some(result) = self.try_vita_fast_action(data, reader) {
++                return result;
++            }
++
+             let action = reader.read_action()?;
++
++            let vita_profile = &mut *self.context.vita_avm1_action_profile;
++            match &action {
++                Action::GetMember => vita_profile.get_member += 1,
++                Action::SetMember => vita_profile.set_member += 1,
++                Action::GetVariable => vita_profile.get_variable += 1,
++                Action::SetVariable => vita_profile.set_variable += 1,
++                Action::CallFunction => vita_profile.call_function += 1,
++                Action::CallMethod => vita_profile.call_method += 1,
++                Action::Push(_) => vita_profile.push += 1,
++                _ => {}
++            }
++
+             avm_debug!(
+                 self.context.avm1,
+                 "({}) Action: {action:?}",
+@@ -644,6 +665,298 @@ impl<'a, 'gc> Activation<'a, 'gc> {
+         }
+     }
+ 
++    #[cfg(target_os = "vita")]
++    #[inline(always)]
++    fn try_vita_fast_action<'b>(
++        &mut self,
++        data: &'b SwfSlice,
++        reader: &mut Reader<'b>,
++    ) -> Option<Result<FrameControl<'gc>, Error<'gc>>> {
++        let input = reader.get_ref();
++        let opcode = *input.first()?;
++
++        if opcode == 0x96 {
++            return self.try_vita_fast_push(data, reader);
++        }
++
++        let result = match opcode {
++            0x0A => self.action_add(),
++            0x0B => self.action_subtract(),
++            0x0C => self.action_multiply(),
++            0x0D => self.action_divide(),
++            0x0E => self.action_equals(),
++            0x0F => self.action_less(),
++            0x10 => self.action_and(),
++            0x11 => self.action_or(),
++            0x12 => self.action_not(),
++            0x13 => self.action_string_equals(),
++            0x14 => self.action_string_length(),
++            0x15 => self.action_string_extract(),
++            0x17 => self.action_pop(),
++            0x18 => self.action_to_integer(),
++            0x1C => {
++                self.context.vita_avm1_action_profile.get_variable += 1;
++                self.action_get_variable()
++            }
++            0x1D => {
++                self.context.vita_avm1_action_profile.set_variable += 1;
++                self.action_set_variable()
++            }
++            0x21 => self.action_string_add(),
++            0x22 => self.action_get_property(),
++            0x23 => self.action_set_property(),
++            0x26 => self.action_trace(),
++            0x29 => self.action_string_less(),
++            0x30 => self.action_random_number(),
++            0x34 => self.action_get_time(),
++            0x3A => self.action_delete(),
++            0x3B => self.action_delete_2(),
++            0x3C => self.action_define_local(),
++            0x3D => {
++                self.context.vita_avm1_action_profile.call_function += 1;
++                self.action_call_function()
++            }
++            0x3E => self.action_return(),
++            0x3F => self.action_modulo(),
++            0x40 => self.action_new_object(),
++            0x41 => self.action_define_local_2(),
++            0x42 => self.action_init_array(),
++            0x43 => self.action_init_object(),
++            0x44 => self.action_type_of(),
++            0x45 => self.action_target_path(),
++            0x47 => self.action_add_2(),
++            0x48 => self.action_less_2(),
++            0x49 => self.action_equals_2(),
++            0x4A => self.action_to_number(),
++            0x4B => self.action_to_string(),
++            0x4C => self.action_push_duplicate(),
++            0x4D => self.action_stack_swap(),
++            0x4E => {
++                self.context.vita_avm1_action_profile.get_member += 1;
++                self.action_get_member()
++            }
++            0x4F => {
++                self.context.vita_avm1_action_profile.set_member += 1;
++                self.action_set_member()
++            }
++            0x50 => self.action_increment(),
++            0x51 => self.action_decrement(),
++            0x52 => {
++                self.context.vita_avm1_action_profile.call_method += 1;
++                self.action_call_method()
++            }
++            0x53 => self.action_new_method(),
++            0x54 => self.action_instance_of(),
++            0x55 => self.action_enumerate_2(),
++            0x60 => self.action_bit_and(),
++            0x61 => self.action_bit_or(),
++            0x62 => self.action_bit_xor(),
++            0x63 => self.action_bit_lshift(),
++            0x64 => self.action_bit_rshift(),
++            0x65 => self.action_bit_urshift(),
++            0x66 => self.action_strict_equals(),
++            0x67 => self.action_greater(),
++            0x68 => self.action_string_greater(),
++            _ => return None,
++        };
++
++        *reader.get_mut() = &input[1..];
++        Some(result)
++    }
++
++    #[cfg(target_os = "vita")]
++    #[inline]
++    fn try_vita_fast_push<'b>(
++        &mut self,
++        data: &'b SwfSlice,
++        reader: &mut Reader<'b>,
++    ) -> Option<Result<FrameControl<'gc>, Error<'gc>>> {
++        let input = reader.get_ref();
++        if input.len() < 3 || input[0] != 0x96 {
++            return None;
++        }
++
++        let payload_len = u16::from_le_bytes([input[1], input[2]]) as usize;
++        let end = 3usize.checked_add(payload_len)?;
++        if end > input.len() {
++            return None;
++        }
++        let payload = &input[3..end];
++
++        let movie_key = std::sync::Arc::as_ptr(&data.movie) as usize;
++        let action_offset = (input.as_ptr() as usize)
++            .saturating_sub(data.movie.data().as_ptr() as usize);
++
++        if let Some(plan) = self.context.avm1.vita_push_plan(movie_key, action_offset) {
++            self.context.vita_avm1_action_profile.push += 1;
++            for operand in plan {
++                let value = match operand {
++                    VitaPushOperand::Static(value) => value,
++                    VitaPushOperand::Register(register) => self.current_register(register),
++                    VitaPushOperand::Constant8(index) => self
++                        .constant_pool()
++                        .get(index as usize)
++                        .copied()
++                        .unwrap_or(Value::Undefined),
++                    VitaPushOperand::Constant16(index) => self
++                        .constant_pool()
++                        .get(index as usize)
++                        .copied()
++                        .unwrap_or(Value::Undefined),
++                };
++                self.stack_push(value);
++            }
++            *reader.get_mut() = &input[end..];
++            return Some(Ok(FrameControl::Continue));
++        }
++
++        let predecoded = self
++            .context
++            .avm1
++            .vita_fast_push_len(movie_key, action_offset)
++            .is_some_and(|cached| cached as usize == payload_len);
++
++        if !predecoded {
++            let mut pos = 0usize;
++            while pos < payload.len() {
++                let ty = payload[pos];
++                pos += 1;
++                let needed = match ty {
++                    0 => {
++                        let rel = payload[pos..].iter().position(|&b| b == 0)?;
++                        pos = pos.checked_add(rel + 1)?;
++                        continue;
++                    }
++                    1 | 7 => 4,
++                    2 | 3 => 0,
++                    4 | 5 | 8 => 1,
++                    6 => 8,
++                    9 => 2,
++                    _ => 0,
++                };
++                pos = pos.checked_add(needed)?;
++                if pos > payload.len() {
++                    return None;
++                }
++            }
++
++            self.context.avm1.vita_record_fast_push_len(
++                movie_key,
++                action_offset,
++                payload_len as u16,
++            );
++        }
++
++        self.context.vita_avm1_action_profile.push += 1;
++        let mut plan = Vec::new();
++        let mut pos = 0usize;
++        while pos < payload.len() {
++            let ty = payload[pos];
++            pos += 1;
++            let value = match ty {
++                0 => {
++                    let value_offset = pos as u16;
++                    let rel = payload[pos..].iter().position(|&b| b == 0).unwrap_or(0);
++                    let cached = self.context.avm1.vita_cached_push_string(
++                        movie_key,
++                        action_offset,
++                        value_offset,
++                    );
++                    let value = if let Some(string) = cached {
++                        string
++                    } else {
++                        let swf_string = swf::SwfStr::from_bytes(&payload[pos..pos + rel]);
++                        let string = AvmString::from(
++                            self.context
++                                .strings
++                                .intern(AvmString::new(self.gc(), swf_string.decode(self.encoding()))),
++                        );
++                        self.context.avm1.vita_cache_push_string(
++                            movie_key,
++                            action_offset,
++                            value_offset,
++                            string,
++                        );
++                        string
++                    };
++                    pos += rel + 1;
++                    let value = Value::from(value);
++                    plan.push(VitaPushOperand::Static(value));
++                    value
++                }
++                1 => {
++                    let bits = u32::from_le_bytes(payload[pos..pos + 4].try_into().ok()?);
++                    pos += 4;
++                    let value = Value::from(f32::from_bits(bits));
++                    plan.push(VitaPushOperand::Static(value));
++                    value
++                }
++                2 => {
++                    plan.push(VitaPushOperand::Static(Value::Null));
++                    Value::Null
++                }
++                3 => {
++                    plan.push(VitaPushOperand::Static(Value::Undefined));
++                    Value::Undefined
++                }
++                4 => {
++                    let register = payload[pos];
++                    pos += 1;
++                    plan.push(VitaPushOperand::Register(register));
++                    self.current_register(register)
++                }
++                5 => {
++                    let value = payload[pos] != 0;
++                    pos += 1;
++                    let value = Value::from(value);
++                    plan.push(VitaPushOperand::Static(value));
++                    value
++                }
++                6 => {
++                    let bits = u64::from_le_bytes(payload[pos..pos + 8].try_into().ok()?).rotate_left(32);
++                    pos += 8;
++                    let value = Value::from(f64::from_bits(bits));
++                    plan.push(VitaPushOperand::Static(value));
++                    value
++                }
++                7 => {
++                    let value = i32::from_le_bytes(payload[pos..pos + 4].try_into().ok()?);
++                    pos += 4;
++                    let value = Value::from(value);
++                    plan.push(VitaPushOperand::Static(value));
++                    value
++                }
++                8 => {
++                    let index = payload[pos];
++                    pos += 1;
++                    plan.push(VitaPushOperand::Constant8(index));
++                    self.constant_pool()
++                        .get(index as usize)
++                        .copied()
++                        .unwrap_or(Value::Undefined)
++                }
++                9 => {
++                    let index = u16::from_le_bytes(payload[pos..pos + 2].try_into().ok()?);
++                    pos += 2;
++                    plan.push(VitaPushOperand::Constant16(index));
++                    self.constant_pool()
++                        .get(index as usize)
++                        .copied()
++                        .unwrap_or(Value::Undefined)
++                }
++                _ => continue,
++            };
++            self.stack_push(value);
++        }
++
++        self.context
++            .avm1
++            .vita_cache_push_plan(movie_key, action_offset, plan);
++
++        *reader.get_mut() = &input[end..];
++        Some(Ok(FrameControl::Continue))
++    }
++
+     fn stack_push(&mut self, mut value: Value<'gc>) {
+         if let Value::Object(obj) = value {
+             // Note that there currently exists a subtle issue with this logic:
+@@ -655,6 +968,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
+             // can refer to a MovieClip
+             // There is a ignored test for this issue of "reference laundering" at "avm1/string_paths_reference_launder"
+             if let Some(mcr) = MovieClipReference::try_from_stage_object(self, obj) {
++                self.context.vita_avm1_action_profile.movieclip_refs += 1;
+                 value = Value::MovieClip(mcr);
+             }
+         }
+@@ -662,14 +976,15 @@ impl<'a, 'gc> Activation<'a, 'gc> {
+         self.context.avm1.push(value);
+     }
+ 
+-    fn pop_call_args(&mut self, num_args: usize) -> Vec<Value<'gc>> {
+-        (0..num_args.min(self.context.avm1.stack_len()))
+-            .map(|_| {
+-                let arg = self.context.avm1.pop();
+-                // Unwrap MovieClipReferences, if possible.
+-                arg.as_object(self).map(Value::from).unwrap_or(arg)
+-            })
+-            .collect()
++    fn pop_call_args(&mut self, num_args: usize) -> smallvec::SmallVec<[Value<'gc>; 4]> {
++        let count = num_args.min(self.context.avm1.stack_len());
++        let mut args = smallvec::SmallVec::<[Value<'gc>; 4]>::with_capacity(count);
++        for _ in 0..count {
++            let arg = self.context.avm1.pop();
++            // Unwrap MovieClipReferences, if possible.
++            args.push(arg.as_object(self).map(Value::from).unwrap_or(arg));
++        }
++        args
+     }
+ 
+     fn action_add(&mut self) -> Result<FrameControl<'gc>, Error<'gc>> {
+@@ -851,8 +1166,15 @@ impl<'a, 'gc> Activation<'a, 'gc> {
+ 
+     fn action_call_function(&mut self) -> Result<FrameControl<'gc>, Error<'gc>> {
+         let fn_name_value = self.context.avm1.pop();
+-        let fn_name = fn_name_value.coerce_to_string(self)?;
+-        let num_args = self.context.avm1.pop().coerce_to_u32(self)? as usize;
++        let fn_name = match fn_name_value {
++            Value::String(name) => name,
++            value => value.coerce_to_string(self)?,
++        };
++        let num_args_value = self.context.avm1.pop();
++        let num_args = match num_args_value {
++            Value::Number(value) if value >= 0.0 && value <= u32::MAX as f64 => value as usize,
++            value => value.coerce_to_u32(self)? as usize,
++        };
+         let args = self.pop_call_args(num_args);
+ 
+         let variable = self.get_variable(fn_name)?;
+@@ -873,7 +1195,11 @@ impl<'a, 'gc> Activation<'a, 'gc> {
+     fn action_call_method(&mut self) -> Result<FrameControl<'gc>, Error<'gc>> {
+         let method_name = self.context.avm1.pop();
+         let object_val = self.context.avm1.pop();
+-        let num_args = self.context.avm1.pop().coerce_to_u32(self)? as usize;
++        let num_args_value = self.context.avm1.pop();
++        let num_args = match num_args_value {
++            Value::Number(value) if value >= 0.0 && value <= u32::MAX as f64 => value as usize,
++            value => value.coerce_to_u32(self)? as usize,
++        };
+         let args = self.pop_call_args(num_args);
+ 
+         // Can not call method on undefined/null.
+@@ -882,12 +1208,15 @@ impl<'a, 'gc> Activation<'a, 'gc> {
+             return Ok(FrameControl::Continue);
+         }
+ 
+-        let object = object_val.coerce_to_object_or_bare(self)?;
++        let object = match object_val {
++            Value::Object(object) => object,
++            value => value.coerce_to_object_or_bare(self)?,
++        };
+ 
+-        let method_name = if method_name == Value::Undefined {
+-            istr!(self, "")
+-        } else {
+-            method_name.coerce_to_string(self)?
++        let method_name = match method_name {
++            Value::Undefined => istr!(self, ""),
++            Value::String(name) => name,
++            value => value.coerce_to_string(self)?,
+         };
+ 
+         let result = if method_name.is_empty() {
+@@ -1175,9 +1504,15 @@ impl<'a, 'gc> Activation<'a, 'gc> {
+ 
+     fn action_get_member(&mut self) -> Result<FrameControl<'gc>, Error<'gc>> {
+         let name_val = self.context.avm1.pop();
+-        let name = name_val.coerce_to_string(self)?;
++        let name = match name_val {
++            Value::String(name) => name,
++            value => value.coerce_to_string(self)?,
++        };
+         let object_val = self.context.avm1.pop();
+-        let object = object_val.coerce_to_object_or_bare(self)?;
++        let object = match object_val {
++            Value::Object(object) => object,
++            value => value.coerce_to_object_or_bare(self)?,
++        };
+ 
+         let result = object.get(name, self)?;
+         self.stack_push(result);
+diff --git a/core/src/avm1/property_map.rs b/core/src/avm1/property_map.rs
+index 74fbe176..0009d52c 100644
+--- a/core/src/avm1/property_map.rs
++++ b/core/src/avm1/property_map.rs
+@@ -4,8 +4,8 @@
+ //! the insertion order of properties, which is necessary for accurate
+ //! enumeration order.
+ 
+-use crate::string::{AvmString, WStr, utils as string_utils};
+-use fnv::FnvBuildHasher;
++use crate::string::{AvmAtom, AvmString, WStr, utils as string_utils};
++use fnv::{FnvBuildHasher, FnvHashMap};
+ use gc_arena::Collect;
+ use indexmap::{Equivalent, IndexMap};
+ use std::hash::{Hash, Hasher};
+@@ -13,43 +13,83 @@ use std::hash::{Hash, Hasher};
+ type FnvIndexMap<K, V> = IndexMap<K, V, FnvBuildHasher>;
+ 
+ /// A map from property names to values.
+-#[derive(Default, Clone, Debug, Collect)]
++#[derive(Clone, Debug, Collect)]
+ #[collect(no_drop)]
+-pub struct PropertyMap<'gc, V>(FnvIndexMap<PropertyName<'gc>, V>);
++pub struct PropertyMap<'gc, V> {
++    ordered: FnvIndexMap<PropertyName<'gc>, V>,
++    atom_index: FnvHashMap<AvmAtom<'gc>, usize>,
++}
++
++impl<V> Default for PropertyMap<'_, V> {
++    fn default() -> Self {
++        Self {
++            ordered: FnvIndexMap::default(),
++            atom_index: FnvHashMap::default(),
++        }
++    }
++}
+ 
+ impl<'gc, V> PropertyMap<'gc, V> {
+     pub fn new() -> Self {
+-        Self(FnvIndexMap::default())
++        Self::default()
+     }
+ 
+     pub fn contains_key<T: AsRef<WStr>>(&self, key: T, case_sensitive: bool) -> bool {
+         if case_sensitive {
+-            self.0.contains_key(&CaseSensitive(key.as_ref()))
++            self.ordered.contains_key(&CaseSensitive(key.as_ref()))
+         } else {
+-            self.0.contains_key(&CaseInsensitive(key.as_ref()))
++            self.ordered.contains_key(&CaseInsensitive(key.as_ref()))
++        }
++    }
++
++    #[inline]
++    pub fn contains_avm_string(&self, key: AvmString<'gc>, case_sensitive: bool) -> bool {
++        if case_sensitive && let Some(atom) = key.as_interned() {
++            return self.contains_interned_key(atom);
+         }
++        self.contains_key(key, case_sensitive)
++    }
++
++    #[inline]
++    pub fn contains_interned_key(&self, key: AvmAtom<'gc>) -> bool {
++        self.atom_index.contains_key(&key)
+     }
+ 
+     pub fn entry<'a>(&'a mut self, key: AvmString<'gc>, case_sensitive: bool) -> Entry<'gc, 'a, V> {
++        if case_sensitive
++            && let Some(atom) = key.as_interned()
++            && let Some(&index) = self.atom_index.get(&atom)
++        {
++            return Entry::Occupied(OccupiedEntry {
++                map: &mut self.ordered,
++                atom_index: &mut self.atom_index,
++                index,
++            });
++        }
++
+         if case_sensitive {
+-            match self.0.get_index_of(&CaseSensitive(key.as_ref())) {
++            match self.ordered.get_index_of(&CaseSensitive(key.as_ref())) {
+                 Some(index) => Entry::Occupied(OccupiedEntry {
+-                    map: &mut self.0,
++                    map: &mut self.ordered,
++                    atom_index: &mut self.atom_index,
+                     index,
+                 }),
+                 None => Entry::Vacant(VacantEntry {
+-                    map: &mut self.0,
++                    map: &mut self.ordered,
++                    atom_index: &mut self.atom_index,
+                     key,
+                 }),
+             }
+         } else {
+-            match self.0.get_index_of(&CaseInsensitive(key.as_ref())) {
++            match self.ordered.get_index_of(&CaseInsensitive(key.as_ref())) {
+                 Some(index) => Entry::Occupied(OccupiedEntry {
+-                    map: &mut self.0,
++                    map: &mut self.ordered,
++                    atom_index: &mut self.atom_index,
+                     index,
+                 }),
+                 None => Entry::Vacant(VacantEntry {
+-                    map: &mut self.0,
++                    map: &mut self.ordered,
++                    atom_index: &mut self.atom_index,
+                     key,
+                 }),
+             }
+@@ -59,24 +99,47 @@ impl<'gc, V> PropertyMap<'gc, V> {
+     /// Gets the value for the specified property.
+     pub fn get<T: AsRef<WStr>>(&self, key: T, case_sensitive: bool) -> Option<&V> {
+         if case_sensitive {
+-            self.0.get(&CaseSensitive(key.as_ref()))
++            self.ordered.get(&CaseSensitive(key.as_ref()))
+         } else {
+-            self.0.get(&CaseInsensitive(key.as_ref()))
++            self.ordered.get(&CaseInsensitive(key.as_ref()))
++        }
++    }
++
++    #[inline]
++    pub fn get_avm_string(&self, key: AvmString<'gc>, case_sensitive: bool) -> Option<&V> {
++        if case_sensitive && let Some(atom) = key.as_interned() {
++            if let Some(value) = self.get_interned(atom) {
++                return Some(value);
++            }
+         }
++        self.get(key, case_sensitive)
++    }
++
++    #[inline]
++    pub fn get_interned(&self, key: AvmAtom<'gc>) -> Option<&V> {
++        self.atom_index
++            .get(&key)
++            .and_then(|&index| self.ordered.get_index(index).map(|(_, value)| value))
+     }
+ 
+     /// Gets a mutable reference to the value for the specified property.
+     pub fn get_mut<T: AsRef<WStr>>(&mut self, key: T, case_sensitive: bool) -> Option<&mut V> {
+         if case_sensitive {
+-            self.0.get_mut(&CaseSensitive(key.as_ref()))
++            self.ordered.get_mut(&CaseSensitive(key.as_ref()))
+         } else {
+-            self.0.get_mut(&CaseInsensitive(key.as_ref()))
++            self.ordered.get_mut(&CaseInsensitive(key.as_ref()))
+         }
+     }
+ 
++    #[inline]
++    pub fn get_interned_mut(&mut self, key: AvmAtom<'gc>) -> Option<&mut V> {
++        let index = *self.atom_index.get(&key)?;
++        self.ordered.get_index_mut(index).map(|(_, value)| value)
++    }
++
+     /// Gets a value by index, based on insertion order.
+     pub fn get_index(&self, index: usize) -> Option<&V> {
+-        self.0.get_index(index).map(|(_, v)| v)
++        self.ordered.get_index(index).map(|(_, v)| v)
+     }
+ 
+     pub fn insert(&mut self, key: AvmString<'gc>, value: V, case_sensitive: bool) -> Option<V> {
+@@ -91,20 +154,33 @@ impl<'gc, V> PropertyMap<'gc, V> {
+ 
+     /// Returns the value tuples in Flash's iteration order (most recently added first).
+     pub fn iter(&self) -> impl Iterator<Item = (AvmString<'gc>, &V)> {
+-        self.0.iter().rev().map(|(k, v)| (k.0, v))
++        self.ordered.iter().rev().map(|(k, v)| (k.0, v))
+     }
+ 
+     /// Returns the key-value tuples in Flash's iteration order (most recently added first).
+     pub fn iter_mut(&mut self) -> impl Iterator<Item = (AvmString<'gc>, &mut V)> {
+-        self.0.iter_mut().rev().map(|(k, v)| (k.0, v))
++        self.ordered.iter_mut().rev().map(|(k, v)| (k.0, v))
+     }
+ 
+     pub fn remove<T: AsRef<WStr>>(&mut self, key: T, case_sensitive: bool) -> Option<V> {
+         // Note that we must use shift_remove to maintain order in case this object is enumerated.
+-        if case_sensitive {
+-            self.0.shift_remove(&CaseSensitive(key.as_ref()))
++        let removed = if case_sensitive {
++            self.ordered.shift_remove(&CaseSensitive(key.as_ref()))
+         } else {
+-            self.0.shift_remove(&CaseInsensitive(key.as_ref()))
++            self.ordered.shift_remove(&CaseInsensitive(key.as_ref()))
++        };
++        if removed.is_some() {
++            self.rebuild_atom_index();
++        }
++        removed
++    }
++
++    fn rebuild_atom_index(&mut self) {
++        self.atom_index.clear();
++        for (index, (key, _)) in self.ordered.iter().enumerate() {
++            if let Some(atom) = key.0.as_interned() {
++                self.atom_index.insert(atom, index);
++            }
+         }
+     }
+ }
+@@ -116,12 +192,19 @@ pub enum Entry<'gc, 'a, V> {
+ 
+ pub struct OccupiedEntry<'gc, 'a, V> {
+     map: &'a mut FnvIndexMap<PropertyName<'gc>, V>,
++    atom_index: &'a mut FnvHashMap<AvmAtom<'gc>, usize>,
+     index: usize,
+ }
+ 
+ impl<'gc, V> OccupiedEntry<'gc, '_, V> {
+     pub fn remove_entry(&mut self) -> (AvmString<'gc>, V) {
+         let (k, v) = self.map.shift_remove_index(self.index).unwrap();
++        self.atom_index.clear();
++        for (index, (key, _)) in self.map.iter().enumerate() {
++            if let Some(atom) = key.0.as_interned() {
++                self.atom_index.insert(atom, index);
++            }
++        }
+         (k.0, v)
+     }
+ 
+@@ -140,11 +223,16 @@ impl<'gc, V> OccupiedEntry<'gc, '_, V> {
+ 
+ pub struct VacantEntry<'gc, 'a, V> {
+     map: &'a mut FnvIndexMap<PropertyName<'gc>, V>,
++    atom_index: &'a mut FnvHashMap<AvmAtom<'gc>, usize>,
+     key: AvmString<'gc>,
+ }
+ 
+ impl<V> VacantEntry<'_, '_, V> {
+     pub fn insert(self, value: V) {
++        let index = self.map.len();
++        if let Some(atom) = self.key.as_interned() {
++            self.atom_index.insert(atom, index);
++        }
+         self.map.insert(PropertyName(self.key), value);
+     }
+ }
+diff --git a/core/src/avm1/runtime.rs b/core/src/avm1/runtime.rs
+index 3bbddf3c..823e33f9 100644
+--- a/core/src/avm1/runtime.rs
++++ b/core/src/avm1/runtime.rs
+@@ -15,9 +15,231 @@ use crate::tag_utils::SwfSlice;
+ use crate::{avm_debug, avm1};
+ use gc_arena::{Collect, Gc, Mutation};
+ use std::borrow::Cow;
++#[cfg(target_os = "vita")]
++use std::collections::{HashMap, HashSet};
++#[cfg(target_os = "vita")]
++use std::ffi::c_void;
+ use swf::avm1::read::Reader;
+ use tracing::instrument;
+ 
++#[cfg(target_os = "vita")]
++unsafe extern "C" {
++    fn flashvita_vita_parallel_for(
++        count: u32,
++        min_grain: u32,
++        callback: unsafe extern "C" fn(*mut c_void, u32, u32),
++        user: *mut c_void,
++    ) -> i32;
++}
++
++#[cfg(target_os = "vita")]
++#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
++struct VitaBlockKey {
++    movie: usize,
++    start: usize,
++    end: usize,
++}
++
++#[cfg(target_os = "vita")]
++#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Collect)]
++#[collect(require_static)]
++struct VitaPushKey {
++    movie: usize,
++    offset: usize,
++}
++
++#[cfg(target_os = "vita")]
++#[derive(Clone, Copy, Collect)]
++#[collect(no_drop)]
++pub(crate) enum VitaPushOperand<'gc> {
++    Static(Value<'gc>),
++    Register(u8),
++    Constant8(u8),
++    Constant16(u16),
++}
++
++#[cfg(target_os = "vita")]
++#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Collect)]
++#[collect(require_static)]
++struct VitaPushStringKey {
++    movie: usize,
++    action_offset: usize,
++    value_offset: u16,
++}
++
++#[cfg(target_os = "vita")]
++#[derive(Default)]
++struct VitaFastActionCache {
++    prepared_blocks: HashSet<VitaBlockKey>,
++    push_lengths: HashMap<VitaPushKey, u16>,
++}
++
++#[cfg(target_os = "vita")]
++#[derive(Clone, Copy)]
++struct VitaPredecodeTask {
++    data: *const u8,
++    len: usize,
++    movie_base: *const u8,
++}
++
++#[cfg(target_os = "vita")]
++#[derive(Clone, Copy)]
++struct VitaPushMeta {
++    offset: u32,
++    len: u16,
++}
++
++#[cfg(target_os = "vita")]
++#[derive(Default)]
++struct VitaPredecodeOutput {
++    pushes: Vec<VitaPushMeta>,
++}
++
++#[cfg(target_os = "vita")]
++struct VitaPredecodeContext {
++    tasks: *const VitaPredecodeTask,
++    outputs: *mut VitaPredecodeOutput,
++}
++
++#[cfg(target_os = "vita")]
++#[inline]
++fn vita_read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
++    let pair = bytes.get(offset..offset.checked_add(2)?)?;
++    Some(u16::from_le_bytes([pair[0], pair[1]]))
++}
++
++#[cfg(target_os = "vita")]
++fn vita_skip_c_string(bytes: &[u8], offset: &mut usize) -> Option<()> {
++    let rel = bytes.get(*offset..)?.iter().position(|&b| b == 0)?;
++    *offset = (*offset).checked_add(rel + 1)?;
++    Some(())
++}
++
++#[cfg(target_os = "vita")]
++fn vita_action_total_len(bytes: &[u8], offset: usize) -> Option<(u8, usize, Option<u16>)> {
++    let opcode = *bytes.get(offset)?;
++    if opcode < 0x80 {
++        return Some((opcode, 1, None));
++    }
++
++    let declared = vita_read_u16(bytes, offset + 1)? as usize;
++    let payload_start = offset.checked_add(3)?;
++    let declared_end = payload_start.checked_add(declared)?;
++    if declared_end > bytes.len() {
++        return None;
++    }
++
++    let mut extra = 0usize;
++    match opcode {
++        // DefineFunction: the function body is not included in ActionLength.
++        0x9B => {
++            let payload = &bytes[payload_start..declared_end];
++            let mut pos = 0usize;
++            vita_skip_c_string(payload, &mut pos)?;
++            let param_count = vita_read_u16(payload, pos)? as usize;
++            pos += 2;
++            for _ in 0..param_count {
++                vita_skip_c_string(payload, &mut pos)?;
++            }
++            extra = vita_read_u16(payload, pos)? as usize;
++        }
++        // DefineFunction2: same body-length rule with register metadata.
++        0x8E => {
++            let payload = &bytes[payload_start..declared_end];
++            let mut pos = 0usize;
++            vita_skip_c_string(payload, &mut pos)?;
++            let param_count = vita_read_u16(payload, pos)? as usize;
++            pos += 2;
++            pos = pos.checked_add(3)?; // register_count + flags
++            for _ in 0..param_count {
++                pos = pos.checked_add(1)?; // register index
++                vita_skip_c_string(payload, &mut pos)?;
++            }
++            extra = vita_read_u16(payload, pos)? as usize;
++        }
++        // Try bodies are stored after the declared action payload.
++        0x8F if declared >= 7 => {
++            let payload = &bytes[payload_start..declared_end];
++            extra = vita_read_u16(payload, 1)? as usize
++                + vita_read_u16(payload, 3)? as usize
++                + vita_read_u16(payload, 5)? as usize;
++        }
++        // With body is stored after the declared action payload.
++        0x94 if declared >= 2 => {
++            extra = vita_read_u16(bytes, payload_start)? as usize;
++        }
++        _ => {}
++    }
++
++    let total = 3usize.checked_add(declared)?.checked_add(extra)?;
++    if offset.checked_add(total)? > bytes.len() {
++        return None;
++    }
++    let push_len = (opcode == 0x96).then_some(declared as u16);
++    Some((opcode, total, push_len))
++}
++
++#[cfg(target_os = "vita")]
++fn vita_validate_push_payload(payload: &[u8]) -> bool {
++    let mut pos = 0usize;
++    while pos < payload.len() {
++        let Some(&ty) = payload.get(pos) else {
++            return false;
++        };
++        pos += 1;
++        match ty {
++            0 => {
++                let Some(rel) = payload[pos..].iter().position(|&b| b == 0) else {
++                    return false;
++                };
++                pos += rel + 1;
++            }
++            1 | 7 => pos += 4,
++            2 | 3 => {}
++            4 | 5 | 8 => pos += 1,
++            6 => pos += 8,
++            9 => pos += 2,
++            _ => {}
++        }
++        if pos > payload.len() {
++            return false;
++        }
++    }
++    true
++}
++
++#[cfg(target_os = "vita")]
++unsafe extern "C" fn vita_predecode_worker(user: *mut c_void, begin: u32, end: u32) {
++    let context = unsafe { &*(user as *const VitaPredecodeContext) };
++    for index in begin as usize..end as usize {
++        let task = unsafe { *context.tasks.add(index) };
++        let output = unsafe { &mut *context.outputs.add(index) };
++        let bytes = unsafe { std::slice::from_raw_parts(task.data, task.len) };
++        let mut pos = 0usize;
++        while pos < bytes.len() {
++            let Some((opcode, total, push_len)) = vita_action_total_len(bytes, pos) else {
++                break;
++            };
++            if let Some(len) = push_len {
++                let payload_start = pos + 3;
++                let payload_end = payload_start + len as usize;
++                if vita_validate_push_payload(&bytes[payload_start..payload_end]) {
++                    let action_offset = (task.data as usize + pos)
++                        .saturating_sub(task.movie_base as usize);
++                    output.pushes.push(VitaPushMeta {
++                        offset: action_offset as u32,
++                        len,
++                    });
++                }
++            }
++            pos += total;
++            if opcode == 0x00 {
++                break;
++            }
++        }
++    }
++}
++
+ /// The global environment.
+ ///
+ /// Because SWFs v6 and v7+ use different case-sensitivity rules, Flash
+@@ -88,6 +310,16 @@ pub struct Avm1<'gc> {
+     /// Used to prevent scrolling on web.
+     has_mouse_listener: bool,
+ 
++    #[cfg(target_os = "vita")]
++    #[collect(require_static)]
++    vita_fast_actions: VitaFastActionCache,
++
++    #[cfg(target_os = "vita")]
++    vita_push_strings: HashMap<VitaPushStringKey, AvmString<'gc>>,
++
++    #[cfg(target_os = "vita")]
++    vita_push_plans: HashMap<VitaPushKey, Vec<VitaPushOperand<'gc>>>,
++
+     /// The list of all movie clips in execution order.
+     clip_exec_list: Option<MovieClip<'gc>>,
+ 
+@@ -127,6 +359,12 @@ impl<'gc> Avm1<'gc> {
+             halted: false,
+             max_recursion_depth: 255,
+             has_mouse_listener: false,
++            #[cfg(target_os = "vita")]
++            vita_fast_actions: VitaFastActionCache::default(),
++            #[cfg(target_os = "vita")]
++            vita_push_strings: HashMap::new(),
++            #[cfg(target_os = "vita")]
++            vita_push_plans: HashMap::new(),
+             clip_exec_list: None,
+ 
+             #[cfg(feature = "avm_debug")]
+@@ -135,6 +373,175 @@ impl<'gc> Avm1<'gc> {
+         }
+     }
+ 
++    #[cfg(target_os = "vita")]
++    pub fn vita_predecode_blocks(&mut self, blocks: &[SwfSlice]) -> (usize, usize, bool) {
++        let mut pending = Vec::new();
++        let mut pending_keys = Vec::new();
++
++        for block in blocks {
++            let movie = std::sync::Arc::as_ptr(&block.movie) as usize;
++            let key = VitaBlockKey {
++                movie,
++                start: block.start,
++                end: block.end,
++            };
++            if self.vita_fast_actions.prepared_blocks.contains(&key) {
++                continue;
++            }
++
++            let data = block.data();
++            pending.push(VitaPredecodeTask {
++                data: data.as_ptr(),
++                len: data.len(),
++                movie_base: block.movie.data().as_ptr(),
++            });
++            pending_keys.push(key);
++        }
++
++        if pending.is_empty() {
++            return (0, 0, false);
++        }
++
++        let mut outputs = pending
++            .iter()
++            .map(|task| VitaPredecodeOutput {
++                // A zero-payload Push still occupies 3 bytes, so this capacity
++                // is a hard upper bound and guarantees no worker-side realloc.
++                pushes: Vec::with_capacity(task.len / 3 + 1),
++            })
++            .collect::<Vec<_>>();
++        let mut predecode_context = VitaPredecodeContext {
++            tasks: pending.as_ptr(),
++            outputs: outputs.as_mut_ptr(),
++        };
++
++        let parallel = if pending.len() >= 3 {
++            unsafe {
++                flashvita_vita_parallel_for(
++                    pending.len() as u32,
++                    1,
++                    vita_predecode_worker,
++                    (&mut predecode_context as *mut VitaPredecodeContext).cast(),
++                ) > 0
++            }
++        } else {
++            false
++        };
++
++        if !parallel {
++            unsafe {
++                vita_predecode_worker(
++                    (&mut predecode_context as *mut VitaPredecodeContext).cast(),
++                    0,
++                    pending.len() as u32,
++                );
++            }
++        }
++
++        let mut push_count = 0usize;
++        for (index, output) in outputs.into_iter().enumerate() {
++            let key = pending_keys[index];
++            for push in output.pushes {
++                self.vita_fast_actions.push_lengths.insert(
++                    VitaPushKey {
++                        movie: key.movie,
++                        offset: push.offset as usize,
++                    },
++                    push.len,
++                );
++                push_count += 1;
++            }
++            self.vita_fast_actions.prepared_blocks.insert(key);
++        }
++
++        (pending.len(), push_count, parallel)
++    }
++
++    #[cfg(target_os = "vita")]
++    #[inline]
++    pub fn vita_fast_push_len(&self, movie: usize, offset: usize) -> Option<u16> {
++        self.vita_fast_actions
++            .push_lengths
++            .get(&VitaPushKey { movie, offset })
++            .copied()
++    }
++
++    #[cfg(target_os = "vita")]
++    #[inline]
++    pub fn vita_record_fast_push_len(&mut self, movie: usize, offset: usize, len: u16) {
++        self.vita_fast_actions
++            .push_lengths
++            .insert(VitaPushKey { movie, offset }, len);
++    }
++
++    #[cfg(target_os = "vita")]
++    #[inline]
++    pub fn vita_cached_push_string(
++        &self,
++        movie: usize,
++        action_offset: usize,
++        value_offset: u16,
++    ) -> Option<AvmString<'gc>> {
++        self.vita_push_strings
++            .get(&VitaPushStringKey {
++                movie,
++                action_offset,
++                value_offset,
++            })
++            .copied()
++    }
++
++    #[cfg(target_os = "vita")]
++    #[inline]
++    pub fn vita_cache_push_string(
++        &mut self,
++        movie: usize,
++        action_offset: usize,
++        value_offset: u16,
++        string: AvmString<'gc>,
++    ) {
++        self.vita_push_strings.insert(
++            VitaPushStringKey {
++                movie,
++                action_offset,
++                value_offset,
++            },
++            string,
++        );
++    }
++
++    #[cfg(target_os = "vita")]
++    #[inline]
++    pub fn vita_push_plan(
++        &self,
++        movie: usize,
++        action_offset: usize,
++    ) -> Option<smallvec::SmallVec<[VitaPushOperand<'gc>; 8]>> {
++        self.vita_push_plans
++            .get(&VitaPushKey {
++                movie,
++                offset: action_offset,
++            })
++            .map(|plan| smallvec::SmallVec::from_slice(plan))
++    }
++
++    #[cfg(target_os = "vita")]
++    #[inline]
++    pub fn vita_cache_push_plan(
++        &mut self,
++        movie: usize,
++        action_offset: usize,
++        plan: Vec<VitaPushOperand<'gc>>,
++    ) {
++        self.vita_push_plans.insert(
++            VitaPushKey {
++                movie,
++                offset: action_offset,
++            },
++            plan,
++        );
++    }
++
+     pub fn load_player_globals(context: &mut UpdateContext<'gc>) {
+         avm1::globals::load_playerglobal(context);
+     }
+@@ -154,14 +561,18 @@ impl<'gc> Avm1<'gc> {
+         }
+ 
+         let clip_obj = active_clip.object1_or_bare(context.gc());
+-        let child_scope = Gc::new(
+-            context.gc(),
+-            Scope::new(
+-                context.avm1.global_scope(active_clip.swf_version()),
+-                scope::ScopeClass::Target,
+-                clip_obj,
+-            ),
+-        );
++        let child_scope = if let Some(movie_clip) = active_clip.as_movie_clip() {
++            movie_clip.avm1_action_scope(context)
++        } else {
++            Gc::new(
++                context.gc(),
++                Scope::new(
++                    context.avm1.global_scope(active_clip.swf_version()),
++                    scope::ScopeClass::Target,
++                    clip_obj,
++                ),
++            )
++        };
+         let constant_pool = context.avm1.constant_pool;
+         let mut child_activation = Activation::from_action(
+             context,
+diff --git a/core/src/display_object/movie_clip.rs b/core/src/display_object/movie_clip.rs
+index 425edf85..a2b4fe47 100644
+--- a/core/src/display_object/movie_clip.rs
++++ b/core/src/display_object/movie_clip.rs
+@@ -3,6 +3,7 @@ use crate::avm1::ActivationIdentifier as Avm1ActivationIdentifier;
+ use crate::avm1::Avm1;
+ use crate::avm1::ExecutionReason as Avm1ExecutionReason;
+ use crate::avm1::globals::AVM_DEPTH_BIAS;
++use crate::avm1::scope::{Scope, ScopeClass};
+ use crate::avm1::{Activation as Avm1Activation, ActivationIdentifier};
+ use crate::avm1::{NativeObject as Avm1NativeObject, Object as Avm1Object};
+ use crate::avm2::Activation as Avm2Activation;
+@@ -176,6 +177,7 @@ pub struct MovieClipData<'gc> {
+     // side and an AVM2 side simultaneously.
+     object1: Lock<Option<Avm1Object<'gc>>>,
+     object2: Lock<Option<Avm2StageObject<'gc>>>,
++    avm1_action_scope: Lock<Option<Gc<'gc, Scope<'gc>>>>,
+ 
+     drop_target: Lock<Option<DisplayObject<'gc>>>,
+ 
+@@ -246,6 +248,7 @@ impl<'gc> MovieClipData<'gc> {
+             audio_stream: Cell::new(None),
+             object1: Lock::new(None),
+             object2: Lock::new(None),
++            avm1_action_scope: Lock::new(None),
+             clip_event_handlers: OnceCell::new(),
+             clip_event_flags: Cell::new(ClipEventFlag::empty()),
+             flags: Cell::new(MovieClipFlags::empty()),
+@@ -272,6 +275,26 @@ impl<'gc> MovieClipData<'gc> {
+ }
+ 
+ impl<'gc> MovieClip<'gc> {
++    #[inline]
++    pub(crate) fn avm1_action_scope(self, context: &mut UpdateContext<'gc>) -> Gc<'gc, Scope<'gc>> {
++        if let Some(scope) = self.0.avm1_action_scope.get() {
++            return scope;
++        }
++
++        let clip_obj = self.object1_or_bare(context.gc());
++        let scope = Gc::new(
++            context.gc(),
++            Scope::new(
++                context.avm1.global_scope(self.swf_version()),
++                ScopeClass::Target,
++                clip_obj,
++            ),
++        );
++        let write = Gc::write(context.gc(), self.0);
++        unlock!(write, MovieClipData, avm1_action_scope).set(Some(scope));
++        scope
++    }
++
+     pub fn downgrade(self) -> MovieClipWeak<'gc> {
+         MovieClipWeak(Gc::downgrade(self.0))
+     }
+@@ -2004,6 +2027,7 @@ impl<'gc> MovieClip<'gc> {
+             );
+             let write = Gc::write(activation.gc(), self.0);
+             unlock!(write, MovieClipData, object1).set(Some(object));
++            unlock!(write, MovieClipData, avm1_action_scope).set(None);
+ 
+             if run_frame {
+                 self.run_frame_avm1(activation.context);
+diff --git a/core/src/player.rs b/core/src/player.rs
+index 2d58d056..2cd2ede8 100644
+--- a/core/src/player.rs
++++ b/core/src/player.rs
+@@ -24,7 +24,9 @@ use crate::backend::{
+ use crate::compatibility_rules::CompatibilityRules;
+ use crate::compatibility_rules::UrlRewriteStage;
+ use crate::config::Letterbox;
+-use crate::context::{ActionQueue, ActionType, RenderContext, UpdateContext};
++use crate::context::{
++    ActionQueue, ActionType, RenderContext, UpdateContext, VitaAvm1ActionProfile,
++};
+ use crate::context_menu::{
+     BuiltInItemFlags, ContextMenuCallback, ContextMenuItem, ContextMenuState,
+ };
+@@ -352,6 +354,9 @@ pub struct Player {
+     frame_rate: f64,
+     forced_frame_rate: bool,
+     actions_since_timeout_check: u32,
++    avm1_action_count: u64,
++    vita_avm1_action_profile: VitaAvm1ActionProfile,
++    vita_frame_profile: VitaFrameProfile,
+ 
+     frame_phase: FramePhase,
+ 
+@@ -422,6 +427,66 @@ pub struct Player {
+     debug_ui: Rc<RefCell<crate::debug_ui::DebugUi>>,
+ }
+ 
++#[derive(Default, Clone, Copy)]
++pub struct VitaFrameProfile {
++    pub preload_us: u64,
++    pub avm2_us: u64,
++    pub avm1_us: u64,
++    pub audio_us: u64,
++    pub local_connections_us: u64,
++    pub callbacks_us: u64,
++    pub avm1_actions: u64,
++    pub avm1_get_member: u64,
++    pub avm1_set_member: u64,
++    pub avm1_get_variable: u64,
++    pub avm1_set_variable: u64,
++    pub avm1_call_function: u64,
++    pub avm1_call_method: u64,
++    pub avm1_push: u64,
++    pub queued_actions_us: u64,
++    pub queued_actions: u64,
++    pub queued_items: u64,
++    pub queued_normal: u64,
++    pub queued_initialize: u64,
++    pub queued_construct: u64,
++    pub queued_method: u64,
++    pub queued_notify: u64,
++    pub queued_get_member: u64,
++    pub queued_set_member: u64,
++    pub queued_get_variable: u64,
++    pub queued_set_variable: u64,
++    pub queued_call_function: u64,
++    pub queued_call_method: u64,
++    pub queued_push: u64,
++    pub queued_movieclip_refs: u64,
++    pub queued_predecode_blocks: u64,
++    pub queued_predecode_pushes: u64,
++    pub queued_predecode_parallel: u64,
++    pub mouse_us: u64,
++    pub gc_us: u64,
++    pub update_calls: u64,
++    pub run_frame_total_us: u64,
++    pub timers_us: u64,
++    pub timer_actions: u64,
++    pub sockets_us: u64,
++    pub net_us: u64,
++    pub stream_us: u64,
++    pub audio_tick_us: u64,
++}
++
++#[derive(Default, Clone, Copy)]
++pub struct VitaQueuedActionProfile {
++    items: u64,
++    normal: u64,
++    initialize: u64,
++    construct: u64,
++    method: u64,
++    notify: u64,
++    predecode_blocks: u64,
++    predecode_pushes: u64,
++    predecode_parallel: u64,
++}
++
+ impl Player {
+     // This method will panic if called inside an `enter_arena_mut` call.
+     fn enter_arena<F, T>(&self, f: F) -> T
+@@ -512,15 +577,26 @@ impl Player {
+     /// This logic is far from perfect, as it doesn't take into account
+     /// that things like rendering also take time. But for now it's good enough.
+     fn max_frames_per_tick(&self) -> u32 {
+-        const MAX_FRAMES_PER_TICK: u32 = 5;
++        #[cfg(target_os = "vita")]
++        {
++            // Vita cannot afford catch-up bursts when a Flash frame is already
++            // CPU-bound. Run at most one SWF frame per host tick and let the
++            // accumulator drop stale work instead of compounding the stall.
++            return 1;
++        }
+ 
+-        if self.recent_run_frame_timings.is_empty() {
+-            5
+-        } else {
+-            let frame_time = self.frame_time(1000.0);
+-            let average_run_frame_time = self.recent_run_frame_timings.iter().sum::<f64>()
+-                / self.recent_run_frame_timings.len() as f64;
+-            ((frame_time / average_run_frame_time) as u32).clamp(1, MAX_FRAMES_PER_TICK)
++        #[cfg(not(target_os = "vita"))]
++        {
++            const MAX_FRAMES_PER_TICK: u32 = 5;
++
++            if self.recent_run_frame_timings.is_empty() {
++                5
++            } else {
++                let frame_time = self.frame_time(1000.0);
++                let average_run_frame_time = self.recent_run_frame_timings.iter().sum::<f64>()
++                    / self.recent_run_frame_timings.len() as f64;
++                ((frame_time / average_run_frame_time) as u32).clamp(1, MAX_FRAMES_PER_TICK)
++            }
+         }
+     }
+ 
+@@ -550,6 +626,8 @@ impl Player {
+             return;
+         }
+ 
++        self.vita_frame_profile = VitaFrameProfile::default();
++
+         self.frame_accumulator += dt;
+         let frame_duration = self.frame_duration();
+ 
+@@ -559,6 +637,10 @@ impl Player {
+         while frame < max_frames_per_tick && self.frame_accumulator >= frame_duration {
+             let timer = Instant::now();
+             self.run_frame();
++            self.vita_frame_profile.run_frame_total_us = self
++                .vita_frame_profile
++                .run_frame_total_us
++                .saturating_add(timer.elapsed().as_micros() as u64);
+             let elapsed = timer.elapsed().as_millis() as f64;
+ 
+             self.add_frame_timing(elapsed);
+@@ -604,13 +686,31 @@ impl Player {
+         });
+         self.frame_accumulator += FloatDuration::from_secs(audio_skew);
+ 
++        let phase_begin = Instant::now();
+         self.update_sockets();
++        self.vita_frame_profile.sockets_us = phase_begin.elapsed().as_micros() as u64;
++
++        let phase_begin = Instant::now();
+         self.update_net_connections();
++        self.vita_frame_profile.net_us = phase_begin.elapsed().as_micros() as u64;
++
++        let timer_actions_before = self.avm1_action_count;
++        let phase_begin = Instant::now();
+         self.update_timers(dt);
++        self.vita_frame_profile.timers_us = phase_begin.elapsed().as_micros() as u64;
++        self.vita_frame_profile.timer_actions = self
++            .avm1_action_count
++            .saturating_sub(timer_actions_before);
++
++        let phase_begin = Instant::now();
+         self.update(|context| {
+             StreamManager::tick(context, dt);
+         });
++        self.vita_frame_profile.stream_us = phase_begin.elapsed().as_micros() as u64;
++
++        let phase_begin = Instant::now();
+         self.audio.tick();
++        self.vita_frame_profile.audio_tick_us = phase_begin.elapsed().as_micros() as u64;
+     }
+ 
+     pub fn time_til_next_timer(&self) -> Option<f64> {
+@@ -2045,6 +2145,7 @@ impl Player {
+ 
+     #[instrument(level = "debug", skip_all)]
+     pub fn run_frame(&mut self) {
++        let preload_begin = Instant::now();
+         let frame_time = self.frame_time(750_000_000.0);
+         let frame_time = Duration::from_nanos(frame_time as u64);
+         let (mut execution_limit, may_execute_while_streaming) = match self.load_behavior {
+@@ -2059,28 +2160,79 @@ impl Player {
+             LoadBehavior::Blocking => (ExecutionLimit::none(), false),
+         };
+         let preload_finished = self.preload(&mut execution_limit);
++        let preload_us = preload_begin.elapsed().as_micros() as u64;
+ 
+         if !preload_finished && !may_execute_while_streaming {
++            self.vita_frame_profile = VitaFrameProfile {
++                preload_us,
++                ..self.vita_frame_profile
++            };
+             return;
+         }
+ 
++        let mut avm2_us = 0;
++        let mut avm1_us = 0;
++        let mut audio_us = 0;
++        let mut local_connections_us = 0;
++        let mut callbacks_us = 0;
++        let mut avm1_actions = 0;
++        let mut avm1_profile = VitaAvm1ActionProfile::default();
+         self.update(|context| {
+             // TODO: Is this order correct?
++            let begin = Instant::now();
+             run_all_phases_avm2(context);
++            avm2_us = begin.elapsed().as_micros() as u64;
++
++            let actions_before = *context.avm1_action_count;
++            let action_profile_before = *context.vita_avm1_action_profile;
++            let begin = Instant::now();
+             Avm1::run_frame(context);
++            avm1_us = begin.elapsed().as_micros() as u64;
++            avm1_actions = context.avm1_action_count.saturating_sub(actions_before);
++            avm1_profile = (*context.vita_avm1_action_profile).saturating_sub(action_profile_before);
++
++            let begin = Instant::now();
+             AudioManager::update_sounds(context);
++            audio_us = begin.elapsed().as_micros() as u64;
++
++            let begin = Instant::now();
+             LocalConnections::update_connections(context);
++            local_connections_us = begin.elapsed().as_micros() as u64;
+ 
+             // Only run the current list of callbacks - any callbacks added during callback execution
+             // will be run at the end of the *next* frame.
++            let begin = Instant::now();
+             for cb in std::mem::take(context.post_frame_callbacks) {
+                 (cb.callback)(context, cb.data);
+             }
++            callbacks_us = begin.elapsed().as_micros() as u64;
+         });
+ 
++        self.vita_frame_profile = VitaFrameProfile {
++            preload_us,
++            avm2_us,
++            avm1_us,
++            audio_us,
++            local_connections_us,
++            callbacks_us,
++            avm1_actions,
++            avm1_get_member: avm1_profile.get_member,
++            avm1_set_member: avm1_profile.set_member,
++            avm1_get_variable: avm1_profile.get_variable,
++            avm1_set_variable: avm1_profile.set_variable,
++            avm1_call_function: avm1_profile.call_function,
++            avm1_call_method: avm1_profile.call_method,
++            avm1_push: avm1_profile.push,
++            ..self.vita_frame_profile
++        };
++
+         self.needs_render = true;
+     }
+ 
++    pub fn vita_frame_profile(&self) -> VitaFrameProfile {
++        self.vita_frame_profile
++    }
++
+     #[instrument(level = "debug", skip_all)]
+     pub fn render(&mut self) {
+         let invalidated = self.enter_arena(|_, gc_root, _| gc_root.stage.invalidated());
+@@ -2197,9 +2349,27 @@ impl Player {
+         &mut *self.ui
+     }
+ 
+-    pub fn run_actions(context: &mut UpdateContext<'_>) {
++    pub fn run_actions(context: &mut UpdateContext<'_>) -> VitaQueuedActionProfile {
++        let mut profile = VitaQueuedActionProfile::default();
++        #[cfg(target_os = "vita")]
++        {
++            let blocks = context.action_queue.vita_bytecode_blocks();
++            let (decoded_blocks, decoded_pushes, parallel) =
++                context.avm1.vita_predecode_blocks(&blocks);
++            profile.predecode_blocks = decoded_blocks as u64;
++            profile.predecode_pushes = decoded_pushes as u64;
++            profile.predecode_parallel = u64::from(parallel);
++        }
+         // Note that actions can queue further actions, so a while loop is necessary here.
+         while let Some(action) = context.action_queue.pop_action() {
++            profile.items += 1;
++            match &action.action_type {
++                ActionType::Normal { .. } => profile.normal += 1,
++                ActionType::Initialize { .. } => profile.initialize += 1,
++                ActionType::Construct { .. } => profile.construct += 1,
++                ActionType::Method { .. } => profile.method += 1,
++                ActionType::NotifyListeners { .. } => profile.notify += 1,
++            }
+             // We don't run frame actions if the clip was removed (or scheduled to be removed) after it queued the action.
+             if !action.is_unload
+                 && (!action.clip.movie().is_action_script_3()
+@@ -2276,6 +2446,7 @@ impl Player {
+                 }
+             }
+         }
++        profile
+     }
+ 
+     /// Runs the closure `f` with an `UpdateContext`.
+@@ -2358,6 +2529,8 @@ impl Player {
+                 frame_rate: &mut this.frame_rate,
+                 forced_frame_rate: this.forced_frame_rate,
+                 actions_since_timeout_check: &mut this.actions_since_timeout_check,
++                avm1_action_count: &mut this.avm1_action_count,
++                vita_avm1_action_profile: &mut this.vita_avm1_action_profile,
+                 frame_phase: &mut this.frame_phase,
+                 stub_tracker: &mut this.stub_tracker,
+                 stream_manager,
+@@ -2391,6 +2564,31 @@ impl Player {
+         })
+     }
+ 
++    pub fn set_avm2_static_bool(
++        &mut self,
++        class_name: &str,
++        property_name: &str,
++        value: bool,
++    ) -> bool {
++        self.mutate_with_update_context(|context| {
++            let domain = context.avm2.stage_domain();
++            let mut activation = Avm2Activation::from_domain(context, domain);
++            let class_name = AvmString::new_utf8(activation.gc(), class_name);
++            let qname = crate::avm2::QName::from_qualified_name(class_name, activation.context);
++            let Ok(class_value) = domain.get_defined_value(&mut activation, qname) else {
++                return false;
++            };
++            let property = AvmString::new_utf8(activation.gc(), property_name);
++            class_value
++                .set_public_property(
++                    property,
++                    crate::avm2::Value::Bool(value),
++                    &mut activation,
++                )
++                .is_ok()
++        })
++    }
++
+     #[cfg(feature = "egui")]
+     pub fn show_debug_ui(&mut self, egui_ctx: &egui::Context, movie_offset: f64) {
+         // To allow using `mutate_with_update_context` and passing the context inside the debug ui,
+@@ -2420,22 +2618,69 @@ impl Player {
+     where
+         F: for<'gc> FnOnce(&mut UpdateContext<'gc>) -> R,
+     {
++        let mut queued_actions_us = 0u64;
++        let mut queued_actions = 0u64;
++        let mut queued_profile = VitaQueuedActionProfile::default();
++        let mut queued_opcode_profile = VitaAvm1ActionProfile::default();
+         let rval = self.mutate_with_update_context(|context| {
+             let rval = func(context);
+ 
+-            Self::run_actions(context);
++            let actions_before = *context.avm1_action_count;
++            let opcode_profile_before = *context.vita_avm1_action_profile;
++            let begin = Instant::now();
++            queued_profile = Self::run_actions(context);
++            queued_actions_us = begin.elapsed().as_micros() as u64;
++            queued_actions = context.avm1_action_count.saturating_sub(actions_before);
++            queued_opcode_profile =
++                (*context.vita_avm1_action_profile).saturating_sub(opcode_profile_before);
+ 
+             rval
+         });
++        self.vita_frame_profile.queued_actions_us = self
++            .vita_frame_profile
++            .queued_actions_us
++            .saturating_add(queued_actions_us);
++        self.vita_frame_profile.queued_actions = self
++            .vita_frame_profile
++            .queued_actions
++            .saturating_add(queued_actions);
++        self.vita_frame_profile.queued_items += queued_profile.items;
++        self.vita_frame_profile.queued_normal += queued_profile.normal;
++        self.vita_frame_profile.queued_initialize += queued_profile.initialize;
++        self.vita_frame_profile.queued_construct += queued_profile.construct;
++        self.vita_frame_profile.queued_method += queued_profile.method;
++        self.vita_frame_profile.queued_notify += queued_profile.notify;
++        self.vita_frame_profile.queued_get_member += queued_opcode_profile.get_member;
++        self.vita_frame_profile.queued_set_member += queued_opcode_profile.set_member;
++        self.vita_frame_profile.queued_get_variable += queued_opcode_profile.get_variable;
++        self.vita_frame_profile.queued_set_variable += queued_opcode_profile.set_variable;
++        self.vita_frame_profile.queued_call_function += queued_opcode_profile.call_function;
++        self.vita_frame_profile.queued_call_method += queued_opcode_profile.call_method;
++        self.vita_frame_profile.queued_push += queued_opcode_profile.push;
++        self.vita_frame_profile.queued_movieclip_refs += queued_opcode_profile.movieclip_refs;
++        self.vita_frame_profile.queued_predecode_blocks += queued_profile.predecode_blocks;
++        self.vita_frame_profile.queued_predecode_pushes += queued_profile.predecode_pushes;
++        self.vita_frame_profile.queued_predecode_parallel += queued_profile.predecode_parallel;
++        self.vita_frame_profile.update_calls = self.vita_frame_profile.update_calls.saturating_add(1);
+ 
+         // Update mouse state (check for new hovered button, etc.)
++        let begin = Instant::now();
+         self.mutate_with_update_context(|context| {
+             Self::update_drag(context);
+         });
+         self.update_mouse_state(EnumSet::empty(), false, &mut false);
++        self.vita_frame_profile.mouse_us = self
++            .vita_frame_profile
++            .mouse_us
++            .saturating_add(begin.elapsed().as_micros() as u64);
+ 
+         // GC
++        let begin = Instant::now();
+         self.gc_arena.borrow_mut().collect_debt();
++        self.vita_frame_profile.gc_us = self
++            .vita_frame_profile
++            .gc_us
++            .saturating_add(begin.elapsed().as_micros() as u64);
+ 
+         rval
+     }
+@@ -3085,6 +3330,9 @@ impl PlayerBuilder {
+                 time_til_next_timer: None,
+                 max_execution_duration: self.max_execution_duration,
+                 actions_since_timeout_check: 0,
++                avm1_action_count: 0,
++                vita_avm1_action_profile: VitaAvm1ActionProfile::default(),
++                vita_frame_profile: VitaFrameProfile::default(),
+ 
+                 // Input
+                 input: InputManager::new(self.gamepad_button_mapping),

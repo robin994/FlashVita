@@ -13,12 +13,14 @@ RUFFLE_BRIDGE_DIR := rust/ruffle_bridge
 RUFFLE_TARGET := armv7-sony-vita-newlibeabihf
 RUFFLE_LIB := $(RUFFLE_BRIDGE_DIR)/target/$(RUFFLE_TARGET)/release/libflashvita_ruffle_bridge.a
 RUFFLE_BRIDGE_SOURCES := $(wildcard $(RUFFLE_BRIDGE_DIR)/src/*.rs) $(RUFFLE_BRIDGE_DIR)/Cargo.toml
+RUFFLE_VENDOR_SOURCES := $(shell find third_party/ruffle/core/src third_party/ruffle/render/src third_party/ruffle/common/src third_party/ruffle/swf/src -type f -name '*.rs' 2>/dev/null)
 
 VITAGL_DIR := /Users/robin994/.local/opt/vitadb-deps/vitaGL-fresh
 IMGUI_VITA_DIR := /Users/robin994/.local/opt/vitadb-deps/imgui-vita-fresh
 
 SOURCES := \
 	src/main.cpp \
+	src/platform/vita_native.cpp \
 	src/ui/app_ui.cpp \
 	src/library/swf_library.cpp \
 	src/input/input_mapper.cpp \
@@ -50,7 +52,9 @@ CXXFLAGS += -DFLASHVITA_ENABLE_RUFFLE=0
 RUFFLE_LINK_INPUT :=
 endif
 
-LDFLAGS := -Wl,-q -Wl,--gc-sections -L$(IMGUI_VITA_DIR) -L$(VITAGL_DIR)
+LDFLAGS := -Wl,-q -Wl,--gc-sections \
+	-Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc -Wl,--wrap=free \
+	-L$(IMGUI_VITA_DIR) -L$(VITAGL_DIR)
 LIBS := \
 	-limgui \
 	-lvitaGL \
@@ -58,13 +62,19 @@ LIBS := \
 	-lSceShaccCgExt \
 	-lmathneon \
 	-ltaihen_stub \
-	-lSceDisplay_stub \
-	-lSceGxm_stub \
+		-lSceDisplay_stub \
+		-lSceAudio_stub \
+		-lSceGxm_stub \
 	-lSceCommonDialog_stub \
+	-lSceIme_stub \
 	-lSceAppUtil_stub \
 	-lSceAppMgr_stub \
 	-lSceKernelThreadMgr_stub \
 	-lSceKernelDmacMgr_stub \
+	-lSceNet_stub \
+	-lSceNetCtl_stub \
+	-lSceHttp_stub \
+	-lSceSsl_stub \
 	-lSceCtrl_stub \
 	-lSceTouch_stub \
 	-lSceSysmodule_stub \
@@ -85,7 +95,7 @@ $(BUILD_DIR)/%.o: %.cpp
 $(ELF): $(OBJECTS) $(RUFFLE_LINK_INPUT)
 	$(CXX) $(CXXFLAGS) $(OBJECTS) $(RUFFLE_LINK_INPUT) $(LDFLAGS) $(LIBS) -o $@
 
-$(RUFFLE_LIB): $(RUFFLE_BRIDGE_SOURCES)
+$(RUFFLE_LIB): $(RUFFLE_BRIDGE_SOURCES) $(RUFFLE_VENDOR_SOURCES)
 	VITASDK=$(VITASDK) cargo +nightly build \
 		-Z build-std=std,panic_abort \
 		--release \
@@ -108,7 +118,7 @@ $(EBOOT): $(VELF)
 
 $(SFO):
 	@mkdir -p $(BUILD_DIR)
-	vita-mksfoex -s TITLE_ID=$(TITLE_ID) "$(TITLE_NAME)" $@
+	vita-mksfoex -d ATTRIBUTE2=12 -s TITLE_ID=$(TITLE_ID) "$(TITLE_NAME)" $@
 
 $(VPK): $(EBOOT) $(SFO)
 	vita-pack-vpk -s $(SFO) -b $(EBOOT) \

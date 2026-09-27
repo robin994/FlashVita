@@ -32,6 +32,8 @@ constexpr std::array<ButtonBinding, static_cast<size_t>(VitaControl::Count)> kBi
     {SCE_CTRL_RIGHT, VitaControl::DpadRight},
 }};
 
+constexpr size_t kBufferedInputSamples = 64;
+
 float stickDelta(uint8_t value, float speed) {
     constexpr int deadzone = 18;
     const int centered = static_cast<int>(value) - 128;
@@ -41,62 +43,165 @@ float stickDelta(uint8_t value, float speed) {
 
 } // namespace
 
+void RuntimeInput::syncMouseButton(FlashPlayer& player) {
+    const bool mouse_down = cross_mouse_down_ || front_touch_down_ || rear_touch_down_;
+    if (mouse_down == previous_mouse_down_) return;
+
+    player.sendMouseMove(mouse_x_, mouse_y_);
+    player.sendMouseButton(mouse_x_, mouse_y_, mouse_down);
+    previous_mouse_down_ = mouse_down;
+    if (mouse_down) cursor_frames_ = 180;
+}
+
 void RuntimeInput::update(FlashPlayer& player, const InputProfile& profile, uint32_t blocked_buttons) {
     if (!player.ruffleRunning()) {
+        initialized_ = false;
         previous_buttons_ = 0;
-        previous_touch_down_ = false;
+        previous_mouse_down_ = false;
+        cross_mouse_down_ = false;
+        front_touch_down_ = false;
+        rear_touch_down_ = false;
+        last_pad_timestamp_ = 0;
+        last_front_touch_timestamp_ = 0;
+        last_rear_touch_timestamp_ = 0;
+        cursor_frames_ = 0;
         return;
     }
 
-    SceCtrlData pad{};
-    sceCtrlPeekBufferPositive(0, &pad, 1);
-    pad.buttons &= ~blocked_buttons;
+    if (cursor_frames_ > 0) --cursor_frames_;
 
-    for (const ButtonBinding& binding : kBindings) {
-        const bool down = (pad.buttons & binding.mask) != 0;
-        const bool was_down = (previous_buttons_ & binding.mask) != 0;
-        if (down != was_down) {
-            const FlashKey key = profile.keys[static_cast<size_t>(binding.control)];
-            if (key != FlashKey::None) player.sendKey(key, down);
+    std::array<SceCtrlData, kBufferedInputSamples> pads{};
+    int pad_count = sceCtrlPeekBufferPositive(0, pads.data(), static_cast<int>(pads.size()));
+    if (pad_count < 0) pad_count = 0;
+    std::sort(pads.begin(), pads.begin() + pad_count,
+              [](const SceCtrlData& a, const SceCtrlData& b) { return a.timeStamp < b.timeStamp; });
+
+    if (!initialized_) {
+        if (pad_count > 0) {
+            const SceCtrlData& latest = pads[pad_count - 1];
+            previous_buttons_ = latest.buttons & ~blocked_buttons;
+            last_pad_timestamp_ = latest.timeStamp;
+            cross_mouse_down_ = profile.cross_mouse_click &&
+                                (previous_buttons_ & SCE_CTRL_CROSS) != 0;
         }
-    }
-    previous_buttons_ = pad.buttons;
-
-    bool touch_down = false;
-    if (profile.front_touch_mouse) {
         SceTouchData touch{};
-        if (sceTouchPeek(SCE_TOUCH_PORT_FRONT, &touch, 1) > 0 && touch.reportNum > 0) {
-            mouse_x_ = std::clamp(touch.report[0].x * 0.5f, 0.0f, 959.0f);
-            mouse_y_ = std::clamp(touch.report[0].y * 0.5f, 0.0f, 543.0f);
-            touch_down = true;
-            player.sendMouseMove(mouse_x_, mouse_y_);
+        if (profile.front_touch_mouse && sceTouchPeek(SCE_TOUCH_PORT_FRONT, &touch, 1) > 0) {
+            last_front_touch_timestamp_ = touch.timeStamp;
+            front_touch_down_ = touch.reportNum > 0;
         }
+        if (profile.rear_touch_mouse && sceTouchPeek(SCE_TOUCH_PORT_BACK, &touch, 1) > 0) {
+            last_rear_touch_timestamp_ = touch.timeStamp;
+            rear_touch_down_ = touch.reportNum > 0;
+        }
+        previous_mouse_down_ = cross_mouse_down_ || front_touch_down_ || rear_touch_down_;
+        initialized_ = true;
     }
 
-    if (!touch_down && profile.rear_touch_mouse) {
-        SceTouchData touch{};
-        if (sceTouchPeek(SCE_TOUCH_PORT_BACK, &touch, 1) > 0 && touch.reportNum > 0) {
-            mouse_x_ = std::clamp(touch.report[0].x * 0.5f, 0.0f, 959.0f);
-            mouse_y_ = std::clamp(touch.report[0].y * 0.5f, 0.0f, 543.0f);
-            touch_down = true;
-            player.sendMouseMove(mouse_x_, mouse_y_);
+    bool pointer_moved = false;
+    float buffered_dx = 0.0f;
+    float buffered_dy = 0.0f;
+    for (int i = 0; i < pad_count; ++i) {
+        const SceCtrlData& pad = pads[i];
+        if (pad.timeStamp <= last_pad_timestamp_) continue;
+
+        const uint32_t buttons = pad.buttons & ~blocked_buttons;
+        if (profile.left_stick_mouse && !front_touch_down_ && !rear_touch_down_) {
+            buffered_dx += stickDelta(pad.lx, profile.mouse_speed);
+            buffered_dy += stickDelta(pad.ly, profile.mouse_speed);
         }
+
+        for (const ButtonBinding& binding : kBindings) {
+            const bool down = (buttons & binding.mask) != 0;
+            const bool was_down = (previous_buttons_ & binding.mask) != 0;
+            if (down != was_down) {
+                const FlashKey key = profile.keys[static_cast<size_t>(binding.control)];
+                if (key != FlashKey::None) player.sendKey(key, down);
+            }
+        }
+
+        const bool cross_down = profile.cross_mouse_click && (buttons & SCE_CTRL_CROSS) != 0;
+        if (cross_down != cross_mouse_down_) {
+            if (buffered_dx != 0.0f || buffered_dy != 0.0f) {
+                mouse_x_ = std::clamp(mouse_x_ + buffered_dx, 0.0f, 959.0f);
+                mouse_y_ = std::clamp(mouse_y_ + buffered_dy, 0.0f, 543.0f);
+                cursor_frames_ = 180;
+                buffered_dx = 0.0f;
+                buffered_dy = 0.0f;
+            }
+            cross_mouse_down_ = cross_down;
+            syncMouseButton(player);
+        }
+
+        previous_buttons_ = buttons;
+        last_pad_timestamp_ = pad.timeStamp;
     }
 
-    if (!touch_down && profile.left_stick_mouse) {
-        const float dx = stickDelta(pad.lx, profile.mouse_speed);
-        const float dy = stickDelta(pad.ly, profile.mouse_speed);
-        if (dx != 0.0f || dy != 0.0f) {
-            mouse_x_ = std::clamp(mouse_x_ + dx, 0.0f, 959.0f);
-            mouse_y_ = std::clamp(mouse_y_ + dy, 0.0f, 543.0f);
-            player.sendMouseMove(mouse_x_, mouse_y_);
-        }
+    if (buffered_dx != 0.0f || buffered_dy != 0.0f) {
+        mouse_x_ = std::clamp(mouse_x_ + buffered_dx, 0.0f, 959.0f);
+        mouse_y_ = std::clamp(mouse_y_ + buffered_dy, 0.0f, 543.0f);
+        cursor_frames_ = 180;
+        pointer_moved = true;
     }
 
-    if (touch_down != previous_touch_down_) {
-        player.sendMouseButton(mouse_x_, mouse_y_, touch_down);
-        previous_touch_down_ = touch_down;
-    }
+    auto processTouchHistory = [&](SceTouchPortType port,
+                                   bool enabled,
+                                   uint64_t& last_timestamp,
+                                   bool& source_down) {
+        if (!enabled) {
+            if (source_down) {
+                source_down = false;
+                syncMouseButton(player);
+            }
+            return;
+        }
+
+        std::array<SceTouchData, kBufferedInputSamples> samples{};
+        int count = sceTouchPeek(port, samples.data(), static_cast<SceUInt32>(samples.size()));
+        if (count < 0) count = 0;
+        std::sort(samples.begin(), samples.begin() + count,
+                  [](const SceTouchData& a, const SceTouchData& b) {
+                      return a.timeStamp < b.timeStamp;
+                  });
+
+        bool moved = false;
+        float latest_x = mouse_x_;
+        float latest_y = mouse_y_;
+        for (int i = 0; i < count; ++i) {
+            const SceTouchData& touch = samples[i];
+            if (touch.timeStamp <= last_timestamp) continue;
+            const bool down = touch.reportNum > 0;
+            if (down) {
+                latest_x = std::clamp(touch.report[0].x * 0.5f, 0.0f, 959.0f);
+                latest_y = std::clamp(touch.report[0].y * 0.5f, 0.0f, 543.0f);
+                cursor_frames_ = 180;
+                moved = true;
+            }
+            if (down != source_down) {
+                if (moved) {
+                    mouse_x_ = latest_x;
+                    mouse_y_ = latest_y;
+                    moved = false;
+                }
+                source_down = down;
+                syncMouseButton(player);
+            }
+            last_timestamp = touch.timeStamp;
+        }
+
+
+        if (moved) {
+            mouse_x_ = latest_x;
+            mouse_y_ = latest_y;
+            pointer_moved = true;
+        }
+    };
+
+    processTouchHistory(SCE_TOUCH_PORT_FRONT, profile.front_touch_mouse,
+                        last_front_touch_timestamp_, front_touch_down_);
+    processTouchHistory(SCE_TOUCH_PORT_BACK, profile.rear_touch_mouse,
+                        last_rear_touch_timestamp_, rear_touch_down_);
+
+    if (pointer_moved) player.sendMouseMove(mouse_x_, mouse_y_);
 }
 
 void RuntimeInput::suspend(FlashPlayer& player, const InputProfile& profile) {
@@ -106,12 +211,20 @@ void RuntimeInput::suspend(FlashPlayer& player, const InputProfile& profile) {
             const FlashKey key = profile.keys[static_cast<size_t>(binding.control)];
             if (key != FlashKey::None) player.sendKey(key, false);
         }
-        if (previous_touch_down_) {
+        if (previous_mouse_down_) {
             player.sendMouseButton(mouse_x_, mouse_y_, false);
         }
     }
     previous_buttons_ = 0;
-    previous_touch_down_ = false;
+    previous_mouse_down_ = false;
+    cross_mouse_down_ = false;
+    front_touch_down_ = false;
+    rear_touch_down_ = false;
+    initialized_ = false;
+    last_pad_timestamp_ = 0;
+    last_front_touch_timestamp_ = 0;
+    last_rear_touch_timestamp_ = 0;
+    cursor_frames_ = 0;
 }
 
 } // namespace flashvita

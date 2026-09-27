@@ -6,7 +6,7 @@ use ruffle_render::bitmap::{
     Bitmap, BitmapHandle, BitmapHandleImpl, BitmapSource, PixelRegion, PixelSnapping, RgbaBufRead,
     SyncHandle,
 };
-use ruffle_render::commands::{CommandHandler, CommandList, RenderBlendMode};
+use ruffle_render::commands::{Command, CommandHandler, CommandList, RenderBlendMode};
 use ruffle_render::error::Error;
 use ruffle_render::matrix::Matrix;
 use ruffle_render::pixel_bender::{PixelBenderShader, PixelBenderShaderHandle};
@@ -17,11 +17,13 @@ use ruffle_render::tessellator::{DrawType, Gradient as TessGradient, Mesh, Shape
 use ruffle_render::transform::Transform;
 use std::any::Any;
 use std::borrow::Cow;
+use std::ffi::c_void;
 use std::fmt::{Debug, Formatter};
 use std::num::NonZeroU32;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use swf::Color;
+use std::time::Instant;
+use swf::{Color, ColorTransform};
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -48,6 +50,12 @@ struct VitaTexVertex {
 }
 
 unsafe extern "C" {
+    fn flashvita_vita_parallel_for(
+        count: u32,
+        min_grain: u32,
+        callback: unsafe extern "C" fn(*mut c_void, u32, u32),
+        user: *mut c_void,
+    ) -> i32;
     fn flashvita_vitagl_begin_flash_frame(r: u8, g: u8, b: u8, a: u8);
     fn flashvita_vitagl_draw_colored_triangles(
         vertices: *const VitaVertex,
@@ -74,6 +82,245 @@ unsafe extern "C" {
     fn flashvita_vitagl_mask_pop(depth: u32);
 }
 
+const NATIVE_PARALLEL_VERTEX_THRESHOLD: usize = 256;
+const FRAME_TRANSFORM_CHUNK_VERTICES: usize = 768;
+
+#[derive(Clone, Copy)]
+struct VitaMatrix2D {
+    a: f32,
+    b: f32,
+    c: f32,
+    d: f32,
+    tx: f32,
+    ty: f32,
+}
+
+impl From<Matrix> for VitaMatrix2D {
+    #[inline]
+    fn from(matrix: Matrix) -> Self {
+        Self {
+            a: matrix.a,
+            b: matrix.b,
+            c: matrix.c,
+            d: matrix.d,
+            tx: matrix.tx.to_pixels() as f32,
+            ty: matrix.ty.to_pixels() as f32,
+        }
+    }
+}
+
+struct ColorTransformJob {
+    source: *const ruffle_render::tessellator::Vertex,
+    destination: *mut VitaVertex,
+    matrix: VitaMatrix2D,
+    color_transform: ColorTransform,
+    color_identity: bool,
+}
+
+struct GradientTransformJob {
+    source: *const ruffle_render::tessellator::Vertex,
+    destination: *mut VitaTexVertex,
+    matrix: VitaMatrix2D,
+    texture_matrix: [[f32; 3]; 3],
+    linear: bool,
+    tint: Color,
+}
+
+struct BitmapTransformJob {
+    source: *const ruffle_render::tessellator::Vertex,
+    destination: *mut VitaTexVertex,
+    matrix: VitaMatrix2D,
+    texture_matrix: [[f32; 3]; 3],
+    tint: Color,
+}
+
+unsafe extern "C" fn transform_color_chunk(user: *mut c_void, begin: u32, end: u32) {
+    let job = unsafe { &*(user.cast::<ColorTransformJob>()) };
+    if job.color_identity {
+        for index in begin as usize..end as usize {
+            let source = unsafe { &*job.source.add(index) };
+            let (x, y) = transform_point_fast(job.matrix, source.x, source.y);
+            unsafe {
+                job.destination.add(index).write(vertex(x, y, source.color));
+            }
+        }
+    } else {
+        for index in begin as usize..end as usize {
+            let source = unsafe { &*job.source.add(index) };
+            let (x, y) = transform_point_fast(job.matrix, source.x, source.y);
+            let color = &job.color_transform * source.color;
+            unsafe {
+                job.destination.add(index).write(vertex(x, y, color));
+            }
+        }
+    }
+}
+
+unsafe extern "C" fn transform_gradient_chunk(user: *mut c_void, begin: u32, end: u32) {
+    let job = unsafe { &*(user.cast::<GradientTransformJob>()) };
+    for index in begin as usize..end as usize {
+        let source = unsafe { &*job.source.add(index) };
+        let (x, y) = transform_point_fast(job.matrix, source.x, source.y);
+        let (u, v) = texture_uv(&job.texture_matrix, source.x, source.y);
+        unsafe {
+            job.destination.add(index).write(tex_vertex(
+                x,
+                y,
+                u,
+                if job.linear { 0.5 } else { v },
+                job.tint,
+            ));
+        }
+    }
+}
+
+unsafe extern "C" fn transform_bitmap_chunk(user: *mut c_void, begin: u32, end: u32) {
+    let job = unsafe { &*(user.cast::<BitmapTransformJob>()) };
+    for index in begin as usize..end as usize {
+        let source = unsafe { &*job.source.add(index) };
+        let (x, y) = transform_point_fast(job.matrix, source.x, source.y);
+        let (u, v) = texture_uv(&job.texture_matrix, source.x, source.y);
+        unsafe {
+            job.destination
+                .add(index)
+                .write(tex_vertex(x, y, u, v, job.tint));
+        }
+    }
+}
+
+enum FrameTransformJob {
+    Color {
+        source: *const ruffle_render::tessellator::Vertex,
+        count: usize,
+        destination_offset: usize,
+        matrix: VitaMatrix2D,
+        color_transform: ColorTransform,
+        color_identity: bool,
+    },
+    Gradient {
+        source: *const ruffle_render::tessellator::Vertex,
+        count: usize,
+        destination_offset: usize,
+        matrix: VitaMatrix2D,
+        texture_matrix: [[f32; 3]; 3],
+        linear: bool,
+        tint: Color,
+    },
+    Bitmap {
+        source: *const ruffle_render::tessellator::Vertex,
+        count: usize,
+        destination_offset: usize,
+        matrix: VitaMatrix2D,
+        texture_matrix: [[f32; 3]; 3],
+        tint: Color,
+    },
+}
+
+struct FrameTransformContext {
+    jobs: *const FrameTransformJob,
+    job_count: usize,
+    color_vertices: *mut VitaVertex,
+    tex_vertices: *mut VitaTexVertex,
+    next_job: AtomicUsize,
+}
+
+unsafe extern "C" fn transform_frame_jobs_worker(
+    user: *mut c_void,
+    _begin: u32,
+    _end: u32,
+) {
+    let context = unsafe { &*(user.cast::<FrameTransformContext>()) };
+    loop {
+        let index = context.next_job.fetch_add(1, Ordering::Relaxed);
+        if index >= context.job_count {
+            break;
+        }
+
+        match unsafe { &*context.jobs.add(index) } {
+            FrameTransformJob::Color {
+                source,
+                count,
+                destination_offset,
+                matrix,
+                color_transform,
+                color_identity,
+            } => {
+                if *color_identity {
+                    for vertex_index in 0..*count {
+                        let source = unsafe { &*source.add(vertex_index) };
+                        let (x, y) = transform_point_fast(*matrix, source.x, source.y);
+                        unsafe {
+                            context
+                                .color_vertices
+                                .add(destination_offset + vertex_index)
+                                .write(vertex(x, y, source.color));
+                        }
+                    }
+                } else {
+                    for vertex_index in 0..*count {
+                        let source = unsafe { &*source.add(vertex_index) };
+                        let (x, y) = transform_point_fast(*matrix, source.x, source.y);
+                        let color = color_transform * source.color;
+                        unsafe {
+                            context
+                                .color_vertices
+                                .add(destination_offset + vertex_index)
+                                .write(vertex(x, y, color));
+                        }
+                    }
+                }
+            }
+            FrameTransformJob::Gradient {
+                source,
+                count,
+                destination_offset,
+                matrix,
+                texture_matrix,
+                linear,
+                tint,
+            } => {
+                for vertex_index in 0..*count {
+                    let source = unsafe { &*source.add(vertex_index) };
+                    let (x, y) = transform_point_fast(*matrix, source.x, source.y);
+                    let (u, v) = texture_uv(texture_matrix, source.x, source.y);
+                    unsafe {
+                        context
+                            .tex_vertices
+                            .add(destination_offset + vertex_index)
+                            .write(tex_vertex(
+                                x,
+                                y,
+                                u,
+                                if *linear { 0.5 } else { v },
+                                *tint,
+                            ));
+                    }
+                }
+            }
+            FrameTransformJob::Bitmap {
+                source,
+                count,
+                destination_offset,
+                matrix,
+                texture_matrix,
+                tint,
+            } => {
+                for vertex_index in 0..*count {
+                    let source = unsafe { &*source.add(vertex_index) };
+                    let (x, y) = transform_point_fast(*matrix, source.x, source.y);
+                    let (u, v) = texture_uv(texture_matrix, source.x, source.y);
+                    unsafe {
+                        context
+                            .tex_vertices
+                            .add(destination_offset + vertex_index)
+                            .write(tex_vertex(x, y, u, v, *tint));
+                    }
+                }
+            }
+        }
+    }
+}
+
 static STAT_FRAMES: AtomicU64 = AtomicU64::new(0);
 static STAT_COLORED_DRAWS: AtomicU64 = AtomicU64::new(0);
 static STAT_TEXTURED_DRAWS: AtomicU64 = AtomicU64::new(0);
@@ -84,6 +331,13 @@ static STAT_MISSING_BITMAPS: AtomicU64 = AtomicU64::new(0);
 static STAT_MASK_OPS: AtomicU64 = AtomicU64::new(0);
 static STAT_BLENDS: AtomicU64 = AtomicU64::new(0);
 static STAT_STAGE3D: AtomicU64 = AtomicU64::new(0);
+static STAT_TRANSFORMED_VERTICES: AtomicU64 = AtomicU64::new(0);
+static STAT_PARALLEL_DRAWS: AtomicU64 = AtomicU64::new(0);
+static STAT_PARALLEL_BATCHES: AtomicU64 = AtomicU64::new(0);
+static STAT_PARALLEL_JOBS: AtomicU64 = AtomicU64::new(0);
+static STAT_COLOR_SUBMISSIONS: AtomicU64 = AtomicU64::new(0);
+static STAT_PREPASS_US: AtomicU64 = AtomicU64::new(0);
+static STAT_SUBMIT_US: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Default)]
 pub struct RendererStatsSnapshot {
@@ -97,6 +351,13 @@ pub struct RendererStatsSnapshot {
     pub mask_ops: u64,
     pub blends: u64,
     pub stage3d: u64,
+    pub transformed_vertices: u64,
+    pub parallel_draws: u64,
+    pub parallel_batches: u64,
+    pub parallel_jobs: u64,
+    pub color_submissions: u64,
+    pub prepass_us: u64,
+    pub submit_us: u64,
 }
 
 pub fn renderer_stats_snapshot() -> RendererStatsSnapshot {
@@ -111,6 +372,13 @@ pub fn renderer_stats_snapshot() -> RendererStatsSnapshot {
         mask_ops: STAT_MASK_OPS.load(Ordering::Relaxed),
         blends: STAT_BLENDS.load(Ordering::Relaxed),
         stage3d: STAT_STAGE3D.load(Ordering::Relaxed),
+        transformed_vertices: STAT_TRANSFORMED_VERTICES.load(Ordering::Relaxed),
+        parallel_draws: STAT_PARALLEL_DRAWS.load(Ordering::Relaxed),
+        parallel_batches: STAT_PARALLEL_BATCHES.load(Ordering::Relaxed),
+        parallel_jobs: STAT_PARALLEL_JOBS.load(Ordering::Relaxed),
+        color_submissions: STAT_COLOR_SUBMISSIONS.load(Ordering::Relaxed),
+        prepass_us: STAT_PREPASS_US.load(Ordering::Relaxed),
+        submit_us: STAT_SUBMIT_US.load(Ordering::Relaxed),
     }
 }
 
@@ -161,10 +429,237 @@ impl Drop for VitaBitmapHandle {
     }
 }
 
+#[derive(Default)]
+struct FrameShapeBatch {
+    jobs: Vec<FrameTransformJob>,
+    color_vertices: Vec<VitaVertex>,
+    tex_vertices: Vec<VitaTexVertex>,
+    transformed_draws: usize,
+}
+
+impl FrameShapeBatch {
+    fn clear(&mut self) {
+        self.jobs.clear();
+        self.color_vertices.clear();
+        self.tex_vertices.clear();
+        self.transformed_draws = 0;
+    }
+
+    fn reserve_color_vertices(&mut self, count: usize) -> usize {
+        let offset = self.color_vertices.len();
+        self.color_vertices.reserve(count);
+        unsafe {
+            self.color_vertices.set_len(offset + count);
+        }
+        offset
+    }
+
+    fn reserve_tex_vertices(&mut self, count: usize) -> usize {
+        let offset = self.tex_vertices.len();
+        self.tex_vertices.reserve(count);
+        unsafe {
+            self.tex_vertices.set_len(offset + count);
+        }
+        offset
+    }
+
+    fn add_color_draw(
+        &mut self,
+        vertices: &[ruffle_render::tessellator::Vertex],
+        transform: &Transform,
+    ) {
+        if vertices.is_empty() {
+            return;
+        }
+        let destination_offset = self.reserve_color_vertices(vertices.len());
+        STAT_TRANSFORMED_VERTICES.fetch_add(vertices.len() as u64, Ordering::Relaxed);
+        self.transformed_draws += 1;
+
+        for chunk_start in (0..vertices.len()).step_by(FRAME_TRANSFORM_CHUNK_VERTICES) {
+            let count = (vertices.len() - chunk_start).min(FRAME_TRANSFORM_CHUNK_VERTICES);
+            self.jobs.push(FrameTransformJob::Color {
+                source: vertices.as_ptr().wrapping_add(chunk_start),
+                count,
+                destination_offset: destination_offset + chunk_start,
+                matrix: transform.matrix.into(),
+                color_transform: transform.color_transform,
+                color_identity: transform.color_transform == ColorTransform::IDENTITY,
+            });
+        }
+    }
+
+    fn add_gradient_draw(
+        &mut self,
+        vertices: &[ruffle_render::tessellator::Vertex],
+        transform: &Transform,
+        texture_matrix: [[f32; 3]; 3],
+        linear: bool,
+        tint: Color,
+    ) {
+        if vertices.is_empty() {
+            return;
+        }
+        let destination_offset = self.reserve_tex_vertices(vertices.len());
+        STAT_TRANSFORMED_VERTICES.fetch_add(vertices.len() as u64, Ordering::Relaxed);
+        self.transformed_draws += 1;
+
+        for chunk_start in (0..vertices.len()).step_by(FRAME_TRANSFORM_CHUNK_VERTICES) {
+            let count = (vertices.len() - chunk_start).min(FRAME_TRANSFORM_CHUNK_VERTICES);
+            self.jobs.push(FrameTransformJob::Gradient {
+                source: vertices.as_ptr().wrapping_add(chunk_start),
+                count,
+                destination_offset: destination_offset + chunk_start,
+                matrix: transform.matrix.into(),
+                texture_matrix,
+                linear,
+                tint,
+            });
+        }
+    }
+
+    fn add_bitmap_draw(
+        &mut self,
+        vertices: &[ruffle_render::tessellator::Vertex],
+        transform: &Transform,
+        texture_matrix: [[f32; 3]; 3],
+        tint: Color,
+    ) {
+        if vertices.is_empty() {
+            return;
+        }
+        let destination_offset = self.reserve_tex_vertices(vertices.len());
+        STAT_TRANSFORMED_VERTICES.fetch_add(vertices.len() as u64, Ordering::Relaxed);
+        self.transformed_draws += 1;
+
+        for chunk_start in (0..vertices.len()).step_by(FRAME_TRANSFORM_CHUNK_VERTICES) {
+            let count = (vertices.len() - chunk_start).min(FRAME_TRANSFORM_CHUNK_VERTICES);
+            self.jobs.push(FrameTransformJob::Bitmap {
+                source: vertices.as_ptr().wrapping_add(chunk_start),
+                count,
+                destination_offset: destination_offset + chunk_start,
+                matrix: transform.matrix.into(),
+                texture_matrix,
+                tint,
+            });
+        }
+    }
+
+    fn collect_shape(&mut self, shape: &VitaShapeHandle, transform: &Transform) {
+        for draw in &shape.mesh.draws {
+            match &draw.draw_type {
+                DrawType::Color => self.add_color_draw(&draw.vertices, transform),
+                DrawType::Gradient { matrix, gradient } => {
+                    let Some(Some(texture)) = shape.gradients.get(*gradient) else {
+                        continue;
+                    };
+                    self.add_gradient_draw(
+                        &draw.vertices,
+                        transform,
+                        *matrix,
+                        matches!(
+                            shape.mesh.gradients[*gradient].gradient_type,
+                            GradientType::Linear
+                        ),
+                        texture_tint(transform),
+                    );
+                    let _ = texture;
+                }
+                DrawType::Bitmap(bitmap) => {
+                    let Some((_, handle)) = shape
+                        .bitmaps
+                        .iter()
+                        .find(|(id, _)| *id == bitmap.bitmap_id)
+                    else {
+                        continue;
+                    };
+                    if texture_from_handle(handle).is_none() {
+                        continue;
+                    }
+                    self.add_bitmap_draw(
+                        &draw.vertices,
+                        transform,
+                        bitmap.matrix,
+                        texture_tint(transform),
+                    );
+                }
+            }
+        }
+    }
+
+    fn collect_commands(&mut self, commands: &CommandList) {
+        for command in &commands.commands {
+            match command {
+                Command::RenderShape { shape, transform } => {
+                    let any = shape.0.as_ref() as &dyn Any;
+                    if let Some(shape) = any.downcast_ref::<VitaShapeHandle>() {
+                        self.collect_shape(shape, transform);
+                    }
+                }
+                Command::RenderAlphaMask {
+                    maskee_commands,
+                    mask_commands: _,
+                } => {
+                    // The Vita backend currently renders only the maskee branch.
+                    self.collect_commands(maskee_commands);
+                }
+                Command::Blend(commands, _) => self.collect_commands(commands),
+                _ => {}
+            }
+        }
+    }
+
+    fn prepare(&mut self, commands: &CommandList) {
+        self.clear();
+        self.collect_commands(commands);
+    }
+
+    fn execute(&mut self) {
+        if self.jobs.is_empty() {
+            return;
+        }
+
+        let mut context = FrameTransformContext {
+            jobs: self.jobs.as_ptr(),
+            job_count: self.jobs.len(),
+            color_vertices: self.color_vertices.as_mut_ptr(),
+            tex_vertices: self.tex_vertices.as_mut_ptr(),
+            next_job: AtomicUsize::new(0),
+        };
+
+        let parallel = self.jobs.len() >= 3
+            && unsafe {
+                flashvita_vita_parallel_for(
+                    3,
+                    1,
+                    transform_frame_jobs_worker,
+                    (&mut context as *mut FrameTransformContext).cast(),
+                )
+            } > 0;
+
+        if parallel {
+            STAT_PARALLEL_BATCHES.fetch_add(1, Ordering::Relaxed);
+            STAT_PARALLEL_DRAWS.fetch_add(self.transformed_draws as u64, Ordering::Relaxed);
+            STAT_PARALLEL_JOBS.fetch_add(self.jobs.len() as u64, Ordering::Relaxed);
+        } else {
+            unsafe {
+                transform_frame_jobs_worker(
+                    (&mut context as *mut FrameTransformContext).cast(),
+                    0,
+                    1,
+                );
+            }
+        }
+    }
+}
+
 pub struct VitaRenderer {
     dimensions: ViewportDimensions,
     tessellator: ShapeTessellator,
     quality: StageQuality,
+    color_scratch: Vec<VitaVertex>,
+    tex_scratch: Vec<VitaTexVertex>,
+    color_index_scratch: Vec<u32>,
+    frame_batch: FrameShapeBatch,
 }
 
 impl VitaRenderer {
@@ -173,16 +668,23 @@ impl VitaRenderer {
             dimensions,
             tessellator: ShapeTessellator::new(),
             quality: StageQuality::High,
+            color_scratch: Vec::new(),
+            tex_scratch: Vec::new(),
+            color_index_scratch: Vec::new(),
+            frame_batch: FrameShapeBatch::default(),
         }
     }
 }
 
 fn transform_point(matrix: Matrix, x: f32, y: f32) -> (f32, f32) {
-    let tx = matrix.tx.to_pixels() as f32;
-    let ty = matrix.ty.to_pixels() as f32;
+    transform_point_fast(matrix.into(), x, y)
+}
+
+#[inline(always)]
+fn transform_point_fast(matrix: VitaMatrix2D, x: f32, y: f32) -> (f32, f32) {
     (
-        matrix.a * x + matrix.c * y + tx,
-        matrix.b * x + matrix.d * y + ty,
+        matrix.a * x + matrix.c * y + matrix.tx,
+        matrix.b * x + matrix.d * y + matrix.ty,
     )
 }
 
@@ -210,38 +712,22 @@ fn tex_vertex(x: f32, y: f32, u: f32, v: f32, color: Color) -> VitaTexVertex {
     }
 }
 
-fn bitmap_tint(transform: &Transform) -> Color {
+fn texture_tint(transform: &Transform) -> Color {
     let mult = transform.color_transform.mult_rgba_normalized();
+    let alpha = mult[3].clamp(0.0, 1.0);
     Color {
-        r: (mult[0].clamp(0.0, 1.0) * 255.0).round() as u8,
-        g: (mult[1].clamp(0.0, 1.0) * 255.0).round() as u8,
-        b: (mult[2].clamp(0.0, 1.0) * 255.0).round() as u8,
-        a: (mult[3].clamp(0.0, 1.0) * 255.0).round() as u8,
+        r: (mult[0].clamp(0.0, 1.0) * alpha * 255.0).round() as u8,
+        g: (mult[1].clamp(0.0, 1.0) * alpha * 255.0).round() as u8,
+        b: (mult[2].clamp(0.0, 1.0) * alpha * 255.0).round() as u8,
+        a: (alpha * 255.0).round() as u8,
     }
 }
 
-fn straight_rgba(bitmap: Bitmap<'_>) -> (u32, u32, Vec<u8>) {
+fn premultiplied_rgba<'a>(bitmap: Bitmap<'a>) -> (u32, u32, Cow<'a, [u8]>) {
     let width = bitmap.width();
     let height = bitmap.height();
     let bitmap = bitmap.to_rgba();
-    let mut pixels = bitmap.data().to_vec();
-
-    // Ruffle stores RGBA bitmaps premultiplied. vitaGL's phase-1 renderer uses
-    // straight-alpha blending for both vector and bitmap content, so normalize once at upload.
-    for pixel in pixels.chunks_exact_mut(4) {
-        let alpha = pixel[3] as u32;
-        if alpha == 0 {
-            pixel[0] = 0;
-            pixel[1] = 0;
-            pixel[2] = 0;
-        } else if alpha < 255 {
-            for channel in &mut pixel[0..3] {
-                let value = (*channel as u32 * 255 + alpha / 2) / alpha;
-                *channel = value.min(255) as u8;
-            }
-        }
-    }
-    (width, height, pixels)
+    (width, height, bitmap.into_buf())
 }
 
 fn texture_from_handle(handle: &BitmapHandle) -> Option<&VitaBitmapHandle> {
@@ -366,9 +852,10 @@ fn create_gradient_texture(gradient: &TessGradient) -> Option<VitaGradientTextur
             };
             let color = gradient_color(gradient, apply_gradient_spread(t, gradient.repeat_mode));
             let offset = ((y * width + x) * 4) as usize;
-            pixels[offset] = color.r;
-            pixels[offset + 1] = color.g;
-            pixels[offset + 2] = color.b;
+            let alpha = color.a as u16;
+            pixels[offset] = ((color.r as u16 * alpha + 127) / 255) as u8;
+            pixels[offset + 1] = ((color.g as u16 * alpha + 127) / 255) as u8;
+            pixels[offset + 2] = ((color.b as u16 * alpha + 127) / 255) as u8;
             pixels[offset + 3] = color.a;
         }
     }
@@ -386,21 +873,85 @@ fn create_gradient_texture(gradient: &TessGradient) -> Option<VitaGradientTextur
     Some(VitaGradientTexture { texture, wrap_mode })
 }
 
-struct VitaCommandHandler {
+struct VitaCommandHandler<'a> {
     mask_depth: u32,
     drawing_mask: bool,
-    color_scratch: Vec<VitaVertex>,
-    tex_scratch: Vec<VitaTexVertex>,
+    color_scratch: &'a mut Vec<VitaVertex>,
+    tex_scratch: &'a mut Vec<VitaTexVertex>,
+    prepared_color: &'a [VitaVertex],
+    prepared_tex: &'a [VitaTexVertex],
+    prepared_color_cursor: usize,
+    prepared_tex_cursor: usize,
+    color_batch_indices: &'a mut Vec<u32>,
+    color_batch_start: Option<usize>,
+    color_batch_end: usize,
 }
 
-impl VitaCommandHandler {
-    fn new() -> Self {
+impl<'a> VitaCommandHandler<'a> {
+    fn new(
+        color_scratch: &'a mut Vec<VitaVertex>,
+        tex_scratch: &'a mut Vec<VitaTexVertex>,
+        color_batch_indices: &'a mut Vec<u32>,
+        prepared_color: &'a [VitaVertex],
+        prepared_tex: &'a [VitaTexVertex],
+    ) -> Self {
         Self {
             mask_depth: 0,
             drawing_mask: false,
-            color_scratch: Vec::new(),
-            tex_scratch: Vec::new(),
+            color_scratch,
+            tex_scratch,
+            color_batch_indices,
+            prepared_color,
+            prepared_tex,
+            prepared_color_cursor: 0,
+            prepared_tex_cursor: 0,
+            color_batch_start: None,
+            color_batch_end: 0,
         }
+    }
+
+    #[inline]
+    fn flush_color_batch(&mut self) {
+        let Some(start) = self.color_batch_start.take() else {
+            return;
+        };
+        let end = self.color_batch_end;
+        if end > start && !self.color_batch_indices.is_empty() {
+            let vertices = &self.prepared_color[start..end];
+            STAT_COLOR_SUBMISSIONS.fetch_add(1, Ordering::Relaxed);
+            unsafe {
+                flashvita_vitagl_draw_colored_triangles(
+                    vertices.as_ptr(),
+                    vertices.len(),
+                    self.color_batch_indices.as_ptr(),
+                    self.color_batch_indices.len(),
+                );
+            }
+        }
+        self.color_batch_indices.clear();
+        self.color_batch_end = 0;
+    }
+
+    #[inline]
+    fn queue_prepared_color_draw(
+        &mut self,
+        draw: &ruffle_render::tessellator::Draw,
+        start: usize,
+        end: usize,
+        index_count: usize,
+    ) {
+        if self.color_batch_start.is_some() && start != self.color_batch_end {
+            self.flush_color_batch();
+        }
+        let batch_start = *self.color_batch_start.get_or_insert(start);
+        let base = (start - batch_start) as u32;
+        self.color_batch_indices.reserve(index_count);
+        self.color_batch_indices.extend(
+            draw.indices[..index_count]
+                .iter()
+                .map(|index| base + *index),
+        );
+        self.color_batch_end = end;
     }
 
     #[inline]
@@ -411,20 +962,155 @@ impl VitaCommandHandler {
             draw.indices.len()
         }
     }
+
+    #[inline]
+    fn prepare_color_vertices(
+        &mut self,
+        vertices: &[ruffle_render::tessellator::Vertex],
+        transform: &Transform,
+    ) {
+        STAT_TRANSFORMED_VERTICES.fetch_add(vertices.len() as u64, Ordering::Relaxed);
+        self.color_scratch.clear();
+        self.color_scratch.reserve(vertices.len());
+
+        unsafe {
+            self.color_scratch.set_len(vertices.len());
+        }
+
+        let mut job = ColorTransformJob {
+            source: vertices.as_ptr(),
+            destination: self.color_scratch.as_mut_ptr(),
+            matrix: transform.matrix.into(),
+            color_transform: transform.color_transform,
+            color_identity: transform.color_transform == ColorTransform::IDENTITY,
+        };
+
+        let parallel = vertices.len() >= NATIVE_PARALLEL_VERTEX_THRESHOLD
+            && unsafe {
+                flashvita_vita_parallel_for(
+                    vertices.len() as u32,
+                    NATIVE_PARALLEL_VERTEX_THRESHOLD as u32,
+                    transform_color_chunk,
+                    (&mut job as *mut ColorTransformJob).cast(),
+                )
+            } > 0;
+
+        if parallel {
+            STAT_PARALLEL_DRAWS.fetch_add(1, Ordering::Relaxed);
+        } else {
+            unsafe {
+                transform_color_chunk(
+                    (&mut job as *mut ColorTransformJob).cast(),
+                    0,
+                    vertices.len() as u32,
+                );
+            }
+        }
+    }
+
+    #[inline]
+    fn prepare_gradient_vertices(
+        &mut self,
+        vertices: &[ruffle_render::tessellator::Vertex],
+        transform: &Transform,
+        texture_matrix: [[f32; 3]; 3],
+        linear: bool,
+        tint: Color,
+    ) {
+        STAT_TRANSFORMED_VERTICES.fetch_add(vertices.len() as u64, Ordering::Relaxed);
+        self.tex_scratch.clear();
+        self.tex_scratch.reserve(vertices.len());
+
+        unsafe {
+            self.tex_scratch.set_len(vertices.len());
+        }
+
+        let mut job = GradientTransformJob {
+            source: vertices.as_ptr(),
+            destination: self.tex_scratch.as_mut_ptr(),
+            matrix: transform.matrix.into(),
+            texture_matrix,
+            linear,
+            tint,
+        };
+
+        let parallel = vertices.len() >= NATIVE_PARALLEL_VERTEX_THRESHOLD
+            && unsafe {
+                flashvita_vita_parallel_for(
+                    vertices.len() as u32,
+                    NATIVE_PARALLEL_VERTEX_THRESHOLD as u32,
+                    transform_gradient_chunk,
+                    (&mut job as *mut GradientTransformJob).cast(),
+                )
+            } > 0;
+
+        if parallel {
+            STAT_PARALLEL_DRAWS.fetch_add(1, Ordering::Relaxed);
+        } else {
+            unsafe {
+                transform_gradient_chunk(
+                    (&mut job as *mut GradientTransformJob).cast(),
+                    0,
+                    vertices.len() as u32,
+                );
+            }
+        }
+    }
+
+    #[inline]
+    fn prepare_bitmap_vertices(
+        &mut self,
+        vertices: &[ruffle_render::tessellator::Vertex],
+        transform: &Transform,
+        texture_matrix: [[f32; 3]; 3],
+        tint: Color,
+    ) {
+        STAT_TRANSFORMED_VERTICES.fetch_add(vertices.len() as u64, Ordering::Relaxed);
+        self.tex_scratch.clear();
+        self.tex_scratch.reserve(vertices.len());
+
+        unsafe {
+            self.tex_scratch.set_len(vertices.len());
+        }
+
+        let mut job = BitmapTransformJob {
+            source: vertices.as_ptr(),
+            destination: self.tex_scratch.as_mut_ptr(),
+            matrix: transform.matrix.into(),
+            texture_matrix,
+            tint,
+        };
+
+        let parallel = vertices.len() >= NATIVE_PARALLEL_VERTEX_THRESHOLD
+            && unsafe {
+                flashvita_vita_parallel_for(
+                    vertices.len() as u32,
+                    NATIVE_PARALLEL_VERTEX_THRESHOLD as u32,
+                    transform_bitmap_chunk,
+                    (&mut job as *mut BitmapTransformJob).cast(),
+                )
+            } > 0;
+
+        if parallel {
+            STAT_PARALLEL_DRAWS.fetch_add(1, Ordering::Relaxed);
+        } else {
+            unsafe {
+                transform_bitmap_chunk(
+                    (&mut job as *mut BitmapTransformJob).cast(),
+                    0,
+                    vertices.len() as u32,
+                );
+            }
+        }
+    }
 }
 
-impl VitaCommandHandler {
+impl VitaCommandHandler<'_> {
     fn draw_mesh(&mut self, mesh: &Mesh, transform: &Transform) {
         for draw in &mesh.draws {
             match &draw.draw_type {
                 DrawType::Color => {
-                    self.color_scratch.clear();
-                    self.color_scratch.reserve(draw.vertices.len().saturating_sub(self.color_scratch.capacity()));
-                    for source in &draw.vertices {
-                        let (x, y) = transform_point(transform.matrix, source.x, source.y);
-                        let color = &transform.color_transform * source.color;
-                        self.color_scratch.push(vertex(x, y, color));
-                    }
+                    self.prepare_color_vertices(&draw.vertices, transform);
                     let index_count = self.index_count(draw);
                     unsafe {
                         flashvita_vitagl_draw_colored_triangles(
@@ -451,57 +1137,80 @@ impl VitaCommandHandler {
         for draw in &shape.mesh.draws {
             match &draw.draw_type {
                 DrawType::Color => {
-                    self.color_scratch.clear();
-                    self.color_scratch.reserve(draw.vertices.len().saturating_sub(self.color_scratch.capacity()));
-                    for source in &draw.vertices {
-                        let (x, y) = transform_point(transform.matrix, source.x, source.y);
-                        let color = &transform.color_transform * source.color;
-                        self.color_scratch.push(vertex(x, y, color));
-                    }
                     let index_count = self.index_count(draw);
-                    unsafe {
-                        flashvita_vitagl_draw_colored_triangles(
-                            self.color_scratch.as_ptr(),
-                            self.color_scratch.len(),
-                            draw.indices.as_ptr(),
-                            index_count,
-                        );
+                    let count = draw.vertices.len();
+                    let start = self.prepared_color_cursor;
+                    let end = start.saturating_add(count);
+                    if end <= self.prepared_color.len() {
+                        self.prepared_color_cursor = end;
+                        self.queue_prepared_color_draw(draw, start, end, index_count);
+                    } else {
+                        self.flush_color_batch();
+                        self.prepare_color_vertices(&draw.vertices, transform);
+                        STAT_COLOR_SUBMISSIONS.fetch_add(1, Ordering::Relaxed);
+                        unsafe {
+                            flashvita_vitagl_draw_colored_triangles(
+                                self.color_scratch.as_ptr(),
+                                self.color_scratch.len(),
+                                draw.indices.as_ptr(),
+                                index_count,
+                            );
+                        }
                     }
                     STAT_COLORED_DRAWS.fetch_add(1, Ordering::Relaxed);
                 }
                 DrawType::Gradient { matrix, gradient } => {
+                    self.flush_color_batch();
                     let Some(Some(texture)) = shape.gradients.get(*gradient) else {
                         STAT_GRADIENT_SKIPS.fetch_add(1, Ordering::Relaxed);
                         continue;
                     };
-                    let tint = bitmap_tint(transform);
-                    self.tex_scratch.clear();
-                    self.tex_scratch.reserve(draw.vertices.len().saturating_sub(self.tex_scratch.capacity()));
-                    for source in &draw.vertices {
-                        let (x, y) = transform_point(transform.matrix, source.x, source.y);
-                        let (u, v) = texture_uv(matrix, source.x, source.y);
-                        let v = if matches!(shape.mesh.gradients[*gradient].gradient_type, GradientType::Linear) {
-                            0.5
-                        } else {
-                            v
-                        };
-                        self.tex_scratch.push(tex_vertex(x, y, u, v, tint));
-                    }
                     let index_count = self.index_count(draw);
-                    unsafe {
-                        flashvita_vitagl_draw_textured_triangles(
-                            texture.texture,
-                            self.tex_scratch.as_ptr(),
-                            self.tex_scratch.len(),
-                            draw.indices.as_ptr(),
-                            index_count,
-                            1,
-                            texture.wrap_mode,
+                    let count = draw.vertices.len();
+                    let start = self.prepared_tex_cursor;
+                    let end = start.saturating_add(count);
+                    if end <= self.prepared_tex.len() {
+                        self.prepared_tex_cursor = end;
+                        let vertices = &self.prepared_tex[start..end];
+                        unsafe {
+                            flashvita_vitagl_draw_textured_triangles(
+                                texture.texture,
+                                vertices.as_ptr(),
+                                vertices.len(),
+                                draw.indices.as_ptr(),
+                                index_count,
+                                1,
+                                texture.wrap_mode,
+                            );
+                        }
+                    } else {
+                        let tint = texture_tint(transform);
+                        self.prepare_gradient_vertices(
+                            &draw.vertices,
+                            transform,
+                            *matrix,
+                            matches!(
+                                shape.mesh.gradients[*gradient].gradient_type,
+                                GradientType::Linear
+                            ),
+                            tint,
                         );
+                        unsafe {
+                            flashvita_vitagl_draw_textured_triangles(
+                                texture.texture,
+                                self.tex_scratch.as_ptr(),
+                                self.tex_scratch.len(),
+                                draw.indices.as_ptr(),
+                                index_count,
+                                1,
+                                texture.wrap_mode,
+                            );
+                        }
                     }
                     STAT_TEXTURED_DRAWS.fetch_add(1, Ordering::Relaxed);
                 }
                 DrawType::Bitmap(bitmap) => {
+                    self.flush_color_batch();
                     let Some((_, handle)) = shape
                         .bitmaps
                         .iter()
@@ -514,25 +1223,43 @@ impl VitaCommandHandler {
                         STAT_MISSING_BITMAPS.fetch_add(1, Ordering::Relaxed);
                         continue;
                     };
-                    let tint = bitmap_tint(transform);
-                    self.tex_scratch.clear();
-                    self.tex_scratch.reserve(draw.vertices.len().saturating_sub(self.tex_scratch.capacity()));
-                    for source in &draw.vertices {
-                        let (x, y) = transform_point(transform.matrix, source.x, source.y);
-                        let (u, v) = texture_uv(&bitmap.matrix, source.x, source.y);
-                        self.tex_scratch.push(tex_vertex(x, y, u, v, tint));
-                    }
                     let index_count = self.index_count(draw);
-                    unsafe {
-                        flashvita_vitagl_draw_textured_triangles(
-                            texture.texture,
-                            self.tex_scratch.as_ptr(),
-                            self.tex_scratch.len(),
-                            draw.indices.as_ptr(),
-                            index_count,
-                            u8::from(bitmap.is_smoothed),
-                            u8::from(bitmap.is_repeating),
+                    let count = draw.vertices.len();
+                    let start = self.prepared_tex_cursor;
+                    let end = start.saturating_add(count);
+                    if end <= self.prepared_tex.len() {
+                        self.prepared_tex_cursor = end;
+                        let vertices = &self.prepared_tex[start..end];
+                        unsafe {
+                            flashvita_vitagl_draw_textured_triangles(
+                                texture.texture,
+                                vertices.as_ptr(),
+                                vertices.len(),
+                                draw.indices.as_ptr(),
+                                index_count,
+                                u8::from(bitmap.is_smoothed),
+                                u8::from(bitmap.is_repeating),
+                            );
+                        }
+                    } else {
+                        let tint = texture_tint(transform);
+                        self.prepare_bitmap_vertices(
+                            &draw.vertices,
+                            transform,
+                            bitmap.matrix,
+                            tint,
                         );
+                        unsafe {
+                            flashvita_vitagl_draw_textured_triangles(
+                                texture.texture,
+                                self.tex_scratch.as_ptr(),
+                                self.tex_scratch.len(),
+                                draw.indices.as_ptr(),
+                                index_count,
+                                u8::from(bitmap.is_smoothed),
+                                u8::from(bitmap.is_repeating),
+                            );
+                        }
                     }
                     STAT_TEXTURED_DRAWS.fetch_add(1, Ordering::Relaxed);
                 }
@@ -541,6 +1268,7 @@ impl VitaCommandHandler {
     }
 
     fn draw_unit_quad(&mut self, color: Color, matrix: Matrix) {
+        self.flush_color_batch();
         let points = [(0.0f32, 0.0f32), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
         let mut vertices = [vertex(0.0, 0.0, color); 4];
         for (i, (x, y)) in points.into_iter().enumerate() {
@@ -548,6 +1276,7 @@ impl VitaCommandHandler {
             vertices[i] = vertex(x, y, color);
         }
         let indices = [0u32, 1, 2, 0, 2, 3];
+        STAT_COLOR_SUBMISSIONS.fetch_add(1, Ordering::Relaxed);
         unsafe {
             flashvita_vitagl_draw_colored_triangles(
                 vertices.as_ptr(),
@@ -559,6 +1288,7 @@ impl VitaCommandHandler {
     }
 
     fn draw_line_points(&mut self, color: Color, matrix: Matrix, rect: bool) {
+        self.flush_color_batch();
         let source: &[(f32, f32)] = if rect {
             &[(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (0.0, 0.0)]
         } else {
@@ -574,7 +1304,7 @@ impl VitaCommandHandler {
     }
 }
 
-impl CommandHandler for VitaCommandHandler {
+impl CommandHandler for VitaCommandHandler<'_> {
     fn render_bitmap(
         &mut self,
         bitmap: BitmapHandle,
@@ -583,6 +1313,7 @@ impl CommandHandler for VitaCommandHandler {
         pixel_snapping: PixelSnapping,
         region: PixelRegion,
     ) {
+        self.flush_color_batch();
         let Some(texture) = texture_from_handle(&bitmap) else {
             STAT_MISSING_BITMAPS.fetch_add(1, Ordering::Relaxed);
             return;
@@ -594,7 +1325,7 @@ impl CommandHandler for VitaCommandHandler {
         let mut matrix = transform.matrix;
         pixel_snapping.apply(&mut matrix);
         matrix *= Matrix::scale(region.width() as f32, region.height() as f32);
-        let tint = bitmap_tint(&transform);
+        let tint = texture_tint(&transform);
         let u0 = region.x_min as f32 / texture.width as f32;
         let u1 = region.x_max as f32 / texture.width as f32;
         let v0 = region.y_min as f32 / texture.height as f32;
@@ -621,6 +1352,7 @@ impl CommandHandler for VitaCommandHandler {
     }
 
     fn render_stage3d(&mut self, _bitmap: BitmapHandle, _transform: Transform) {
+        self.flush_color_batch();
         STAT_STAGE3D.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -633,8 +1365,10 @@ impl CommandHandler for VitaCommandHandler {
 
     fn render_alpha_mask(&mut self, maskee_commands: CommandList, _mask_commands: CommandList) {
         // Phase 1: render the content and ignore the alpha mask until the stencil path lands.
+        self.flush_color_batch();
         STAT_MASK_OPS.fetch_add(1, Ordering::Relaxed);
         maskee_commands.execute(self);
+        self.flush_color_batch();
     }
 
     fn draw_rect(&mut self, color: Color, matrix: Matrix) {
@@ -650,6 +1384,7 @@ impl CommandHandler for VitaCommandHandler {
     }
 
     fn push_mask(&mut self) {
+        self.flush_color_batch();
         unsafe { flashvita_vitagl_mask_push(self.mask_depth) };
         self.mask_depth += 1;
         self.drawing_mask = true;
@@ -657,6 +1392,7 @@ impl CommandHandler for VitaCommandHandler {
     }
 
     fn activate_mask(&mut self) {
+        self.flush_color_batch();
         if self.mask_depth > 0 {
             unsafe { flashvita_vitagl_mask_activate(self.mask_depth) };
         }
@@ -665,6 +1401,7 @@ impl CommandHandler for VitaCommandHandler {
     }
 
     fn deactivate_mask(&mut self) {
+        self.flush_color_batch();
         if self.mask_depth > 0 {
             unsafe { flashvita_vitagl_mask_deactivate(self.mask_depth) };
         }
@@ -673,6 +1410,7 @@ impl CommandHandler for VitaCommandHandler {
     }
 
     fn pop_mask(&mut self) {
+        self.flush_color_batch();
         if self.mask_depth > 0 {
             self.mask_depth -= 1;
             unsafe { flashvita_vitagl_mask_pop(self.mask_depth) };
@@ -682,8 +1420,10 @@ impl CommandHandler for VitaCommandHandler {
     }
 
     fn blend(&mut self, commands: CommandList, _blend_mode: RenderBlendMode) {
+        self.flush_color_batch();
         STAT_BLENDS.fetch_add(1, Ordering::Relaxed);
         commands.execute(self);
+        self.flush_color_batch();
     }
 }
 
@@ -756,8 +1496,23 @@ impl RenderBackend for VitaRenderer {
         _cache_entries: Vec<BitmapCacheEntry>,
     ) {
         STAT_FRAMES.fetch_add(1, Ordering::Relaxed);
+        let prepass_begin = Instant::now();
+        self.frame_batch.prepare(&commands);
+        self.frame_batch.execute();
+        STAT_PREPASS_US.fetch_add(prepass_begin.elapsed().as_micros() as u64, Ordering::Relaxed);
+
+        let submit_begin = Instant::now();
         unsafe { flashvita_vitagl_begin_flash_frame(clear.r, clear.g, clear.b, clear.a) };
-        commands.execute(&mut VitaCommandHandler::new());
+        let mut handler = VitaCommandHandler::new(
+            &mut self.color_scratch,
+            &mut self.tex_scratch,
+            &mut self.color_index_scratch,
+            &self.frame_batch.color_vertices,
+            &self.frame_batch.tex_vertices,
+        );
+        commands.execute(&mut handler);
+        handler.flush_color_batch();
+        STAT_SUBMIT_US.fetch_add(submit_begin.elapsed().as_micros() as u64, Ordering::Relaxed);
     }
 
     fn create_empty_texture(
@@ -780,7 +1535,7 @@ impl RenderBackend for VitaRenderer {
     }
 
     fn register_bitmap(&mut self, bitmap: Bitmap<'_>) -> Result<BitmapHandle, Error> {
-        let (width, height, pixels) = straight_rgba(bitmap);
+        let (width, height, pixels) = premultiplied_rgba(bitmap);
         let texture = unsafe { flashvita_vitagl_create_texture(pixels.as_ptr(), width, height) };
         if texture == 0 {
             return Err(Error::Unimplemented("vitaGL bitmap upload failed".into()));
@@ -802,7 +1557,7 @@ impl RenderBackend for VitaRenderer {
         let Some(texture) = texture_from_handle(handle) else {
             return Err(Error::Unimplemented("invalid FlashVita bitmap handle".into()));
         };
-        let (width, height, pixels) = straight_rgba(bitmap);
+        let (width, height, pixels) = premultiplied_rgba(bitmap);
         if width != texture.width || height != texture.height {
             return Err(Error::Unimplemented("FlashVita bitmap resize is not supported yet".into()));
         }

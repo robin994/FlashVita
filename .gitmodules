@@ -1,0 +1,4 @@
+[submodule "third_party/ruffle"]
+	path = third_party/ruffle
+	url = https://github.com/robin994/ruffle.git
+	branch = flashvita-v0.15.27

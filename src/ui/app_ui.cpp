@@ -1,4 +1,6 @@
 #include "app_ui.h"
+#include "../version.h"
+#include "../platform/vita_native.h"
 
 #include <cstdio>
 #include <imgui_vita.h>
@@ -67,8 +69,12 @@ void AppUi::drawTopBar() {
                  ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
                  ImGuiWindowFlags_NoScrollbar);
 
+    ImGui::SetCursorPos(ImVec2(12.0f, 7.0f));
     ImGui::Text("FlashVita");
-    ImGui::SameLine(120.0f);
+    ImGui::SetCursorPos(ImVec2(12.0f, 27.0f));
+    ImGui::TextDisabled("%s", FLASHVITA_VERSION_LABEL);
+
+    ImGui::SetCursorPos(ImVec2(120.0f, 10.0f));
     if (ImGui::Button("Library", ImVec2(110.0f, 32.0f))) screen_ = Screen::Library;
     ImGui::SameLine();
     if (ImGui::Button("Controls", ImVec2(110.0f, 32.0f))) screen_ = Screen::Controls;
@@ -135,7 +141,11 @@ void AppUi::drawLibrary() {
         ImGui::TextWrapped("%s", game->path.c_str());
         ImGui::Spacing();
         if (ImGui::Button("Play", ImVec2(150.0f, 40.0f))) {
-            player_.open(game->path);
+            pending_launch_path_ = game->path;
+            pending_launch_name_ = game->name;
+            launch_requested_ = true;
+            launch_loading_ = true;
+            launch_screen_presented_ = false;
             screen_ = Screen::Player;
         }
         ImGui::SameLine();
@@ -169,6 +179,13 @@ void AppUi::drawSettings() {
     ImGui::Checkbox("VSync", &config_.vsync);
     ImGui::Checkbox("Show SWF files with invalid/unknown headers", &config_.show_invalid_swf);
     ImGui::Checkbox("Remember last game (reserved for runtime milestone)", &config_.remember_last_game);
+    const bool old_logs = config_.enable_logs;
+    ImGui::Checkbox("Enable runtime logs", &config_.enable_logs);
+    if (old_logs != config_.enable_logs) {
+        vita::setLoggingEnabled(config_.enable_logs);
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("Disable for lower I/O overhead and better runtime performance");
 
     ImGui::Spacing();
     ImGui::Text("Storage");
@@ -232,6 +249,7 @@ void AppUi::drawControls() {
     ImGui::Checkbox("Left stick controls mouse", &profile.left_stick_mouse);
     ImGui::Checkbox("Front touch controls mouse", &profile.front_touch_mouse);
     ImGui::Checkbox("Rear touch controls mouse", &profile.rear_touch_mouse);
+    ImGui::Checkbox("Cross clicks / drags mouse", &profile.cross_mouse_click);
     ImGui::SliderFloat("Mouse speed", &profile.mouse_speed, 0.25f, 3.0f, "%.2fx");
     ImGui::Spacing();
     ImGui::TextWrapped("These mappings will be translated to Flash keyboard/mouse events once the runtime is connected.");
@@ -257,6 +275,32 @@ void AppUi::drawPlayer() {
     ImGui::SetNextWindowSize(ImVec2(900.0f, 450.0f), ImGuiSetCond_Always);
     ImGui::Begin("Flash Player", nullptr,
                  ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse);
+
+    if (launch_loading_) {
+        launch_screen_presented_ = true;
+        ImGui::SetCursorPosY(120.0f);
+        ImGui::SetWindowFontScale(1.35f);
+        ImGui::Text("Loading SWF...");
+        ImGui::SetWindowFontScale(1.0f);
+        ImGui::Spacing();
+        if (!pending_launch_name_.empty()) {
+            ImGui::TextWrapped("%s", pending_launch_name_.c_str());
+        }
+        ImGui::Spacing();
+        ImGui::TextWrapped("Parsing, decompressing and initializing ActionScript. Large SWFs can spend several seconds in first-frame startup on PS Vita.");
+        ImGui::Spacing();
+        ImGui::TextDisabled("Waiting for the first visible frame...");
+        ImGui::Spacing();
+        if (ImGui::Button("Back to library", ImVec2(180.0f, 40.0f))) {
+            player_.close();
+            launch_requested_ = false;
+            launch_loading_ = false;
+            launch_screen_presented_ = false;
+            screen_ = Screen::Library;
+        }
+        ImGui::End();
+        return;
+    }
 
     ImGui::Text("Runtime bring-up placeholder");
     ImGui::Separator();
@@ -321,13 +365,20 @@ void AppUi::drawPlayer() {
         ImGui::TextWrapped("%s", ruffle.message.c_str());
     }
 
-    ImGui::TextWrapped("Ruffle now owns AVM1/AVM2 and timeline execution. The next renderer steps are bitmap textures, gradients, masks, text, audio and persistent SharedObject storage on Vita.");
+    ImGui::TextWrapped("Ruffle owns AVM1/AVM2, timeline execution and Vita-native threaded audio. Remaining renderer work includes bitmap coverage, gradients, masks, text and persistent SharedObject storage.");
     ImGui::Spacing();
     if (ImGui::Button("Close player", ImVec2(180.0f, 40.0f))) {
         player_.close();
         screen_ = Screen::Library;
     }
     ImGui::End();
+}
+
+bool AppUi::takeLaunchRequest(std::string& path) {
+    if (!launch_requested_ || !launch_screen_presented_) return false;
+    path = pending_launch_path_;
+    launch_requested_ = false;
+    return !path.empty();
 }
 
 void AppUi::draw() {
