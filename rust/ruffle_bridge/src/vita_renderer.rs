@@ -97,6 +97,16 @@ unsafe extern "C" {
     fn flashvita_vitagl_draw_colored_line_strip(vertices: *const VitaVertex, vertex_count: usize);
     fn flashvita_vitagl_create_texture(data: *const u8, width: u32, height: u32) -> u32;
     fn flashvita_vitagl_create_texture_zero_copy(data: *mut u8, width: u32, height: u32) -> u32;
+    fn flashvita_vitagl_update_zero_copy_texture(
+        texture: u32,
+        data: *const u8,
+        source_width: u32,
+        source_height: u32,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+    );
     fn flashvita_vitagl_update_texture(texture: u32, data: *const u8, width: u32, height: u32);
     fn flashvita_vitagl_update_texture_region(
         texture: u32,
@@ -1324,6 +1334,9 @@ fn create_gradient_texture(
     gradient: &TessGradient,
     cache: &mut HashMap<u64, Weak<VitaGradientTexture>>,
 ) -> Option<Arc<VitaGradientTexture>> {
+    if cache.len() > 256 {
+        cache.retain(|_, texture| texture.strong_count() != 0);
+    }
     let (width, height) = match gradient.gradient_type {
         GradientType::Linear => (256u32, 1u32),
         GradientType::Radial | GradientType::Focal => (64u32, 64u32),
@@ -2062,12 +2075,21 @@ impl CommandHandler for VitaCommandHandler<'_> {
         }
     }
 
-    fn render_alpha_mask(&mut self, maskee_commands: CommandList, _mask_commands: CommandList) {
-        // Phase 1: render the content and ignore the alpha mask until the stencil path lands.
+    fn render_alpha_mask(&mut self, maskee_commands: CommandList, mask_commands: CommandList) {
+        // Alpha masks share the same nested stencil depth used by ordinary SWF masks.
+        // Draw the mask once to increment stencil, render the maskee through it, then
+        // replay the mask with the decrement op to restore the previous depth.
         self.flush_batches();
-        STAT_MASK_OPS.fetch_add(1, Ordering::Relaxed);
+        self.push_mask();
+        mask_commands.clone().execute(self);
+        self.flush_batches();
+        self.activate_mask();
         maskee_commands.execute(self);
         self.flush_batches();
+        self.deactivate_mask();
+        mask_commands.execute(self);
+        self.flush_batches();
+        self.pop_mask();
     }
 
     fn draw_rect(&mut self, color: Color, matrix: Matrix) {
@@ -2353,8 +2375,20 @@ impl RenderBackend for VitaRenderer {
             && bitmap.format() == BitmapFormat::Rgba
             && texture.external_data == bitmap.data().as_ptr()
         {
-            // The texture samples the BitmapData VGL_RAM block directly.
-            // No CPU-side copy or glTexSubImage is needed.
+            unsafe {
+                flashvita_vitagl_update_zero_copy_texture(
+                    texture.texture,
+                    bitmap.data().as_ptr(),
+                    width,
+                    height,
+                    region.x_min,
+                    region.y_min,
+                    region.width(),
+                    region.height(),
+                );
+            }
+            // The bridge double-buffers VGL_RAM storage and swaps the descriptor;
+            // there is no glTexSubImage upload on this path.
             texture.offscreen_y_flipped.store(false, Ordering::Relaxed);
             return Ok(());
         }

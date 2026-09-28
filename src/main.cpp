@@ -12,6 +12,7 @@
 #include <vitaGL.h>
 
 #include <algorithm>
+#include <string>
 
 #include "config/app_config.h"
 #include "input/input_mapper.h"
@@ -55,6 +56,42 @@ void ensureDataDirectories() {
     sceIoMkdir("ux0:data/FlashVita/games", 0777);
     sceIoMkdir("ux0:data/FlashVita/profiles", 0777);
     sceIoMkdir("ux0:data/FlashVita/saves", 0777);
+}
+
+bool takeAutoloadGame(std::string& path, std::string& name) {
+    constexpr const char* kAutoloadPath = "ux0:data/FlashVita/autoload.txt";
+    const SceUID fd = sceIoOpen(kAutoloadPath, SCE_O_RDONLY, 0);
+    if (fd < 0) return false;
+
+    char buffer[512]{};
+    const int read = sceIoRead(fd, buffer, sizeof(buffer) - 1);
+    sceIoClose(fd);
+    sceIoRemove(kAutoloadPath);
+    if (read <= 0) return false;
+
+    std::string value(buffer, static_cast<size_t>(read));
+    while (!value.empty() &&
+           (value.back() == '\n' || value.back() == '\r' || value.back() == ' ' ||
+            value.back() == '\t')) {
+        value.pop_back();
+    }
+    size_t first = 0;
+    while (first < value.size() &&
+           (value[first] == ' ' || value[first] == '\t' || value[first] == '\r' ||
+            value[first] == '\n')) {
+        ++first;
+    }
+    value.erase(0, first);
+    if (value.empty()) return false;
+
+    const size_t slash = value.find_last_of("/\\");
+    name = slash == std::string::npos ? value : value.substr(slash + 1);
+    if (value.find(':') != std::string::npos || slash != std::string::npos) {
+        path = value;
+    } else {
+        path = "ux0:data/FlashVita/games/" + value;
+    }
+    return !name.empty();
 }
 
 void requestGameClocks() {
@@ -189,6 +226,8 @@ int main() {
     ImGui_ImplVitaGL_MouseStickUsage(true);
     ImGui::GetIO().MouseDrawCursor = true;
     logMarker("imgui_backend_init_pass");
+    flashvita::RuffleRuntime::setAsyncRendererEnabled(config.async_renderer);
+    bool applied_async_renderer = config.async_renderer;
 
     flashvita::SwfLibrary library;
     library.scan("ux0:data/FlashVita/games");
@@ -197,6 +236,25 @@ int main() {
     flashvita::FlashPlayer player;
     flashvita::AppUi ui(library, input, config, player);
     logMarker("ui_constructed");
+
+    std::string autoload_path;
+    std::string autoload_name;
+    if (takeAutoloadGame(autoload_path, autoload_name)) {
+        input.loadForGame(autoload_name);
+        char marker[640];
+        sceClibSnprintf(
+            marker,
+            sizeof(marker),
+            "autoload game=%s path=%s",
+            autoload_name.c_str(),
+            autoload_path.c_str());
+        logMarker(marker);
+        if (player.open(autoload_path)) {
+            logMarker("autoload_runtime_started");
+        } else {
+            logMarker("autoload_runtime_failed");
+        }
+    }
 
     unsigned frame = 0;
     bool ui_visible = true;
@@ -214,12 +272,17 @@ int main() {
     constexpr uint32_t kUiToggleMask = SCE_CTRL_LTRIGGER | SCE_CTRL_RTRIGGER | SCE_CTRL_START;
     for (;;) {
         bool loading_ready_to_show_game = false;
+        bool async_presented = false;
         const bool profile_frame = flashvita::vita::perfLoggingEnabled();
         const uint64_t loop_begin_us = profile_frame ? sceKernelGetProcessTimeWide() : 0;
         sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DEFAULT);
         if (applied_vsync != config.vsync) {
             vglWaitVblankStart(config.vsync ? GL_TRUE : GL_FALSE);
             applied_vsync = config.vsync;
+        }
+        if (applied_async_renderer != config.async_renderer) {
+            flashvita::RuffleRuntime::setAsyncRendererEnabled(config.async_renderer);
+            applied_async_renderer = config.async_renderer;
         }
         uint64_t game_work_us = 0;
 
@@ -277,6 +340,15 @@ int main() {
                 !player.renderedLastTick()) {
                 player.renderNow();
             }
+            const bool main_gl_overlay = ui_visible || ui.launchLoading() ||
+                player.virtualKeyboardActive() || runtime_input.cursorVisible();
+            if (player.renderedLastTick()) {
+                const bool worker_present = !main_gl_overlay;
+                if (flashvita::RuffleRuntime::commitAsyncFrame(worker_present)) {
+                    async_presented = worker_present;
+                    if (main_gl_overlay) flashvita::RuffleRuntime::waitAsyncRenderer();
+                }
+            }
             if (ui.launchLoading() &&
                 flashvita::RuffleRuntime::visibleDrawCount() > launch_visible_draw_baseline) {
                 loading_ready_to_show_game = true;
@@ -320,7 +392,9 @@ int main() {
             player.renderedLastTick() || player.virtualKeyboardActive() ||
             runtime_input.cursorVisible();
         const uint64_t swap_begin_us = profile_frame ? sceKernelGetProcessTimeWide() : 0;
-        if (should_present) {
+        if (async_presented) {
+            // The CPU1 render worker owns the swap for this game-only frame.
+        } else if (should_present) {
             vglSwapBuffers(player.virtualKeyboardActive() ? GL_TRUE : GL_FALSE);
         } else {
             // Keep 60 Hz host pacing without resubmitting the same Flash frame.
@@ -391,5 +465,6 @@ int main() {
         ++frame;
     }
 
+    flashvita::RuffleRuntime::shutdownAsyncRenderer();
     return 0;
 }

@@ -33,6 +33,10 @@ public:
     static const char* bridgeVersion();
     static void prepareUiGraphics();
     static uint64_t visibleDrawCount();
+    static void setAsyncRendererEnabled(bool enabled);
+    static bool commitAsyncFrame(bool present);
+    static void waitAsyncRenderer();
+    static void shutdownAsyncRenderer();
 
     bool probeFile(const std::string& path, RuffleProbeInfo& out);
     bool startHeadless(const std::string& path, RuffleProbeInfo& out);

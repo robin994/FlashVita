@@ -23,6 +23,7 @@ void AppConfig::load() {
         else if (std::sscanf(line.c_str(), "remember_last_game=%d", &value) == 1) remember_last_game = value != 0;
         else if (std::sscanf(line.c_str(), "enable_logs=%d", &value) == 1) enable_logs = value != 0;
         else if (std::sscanf(line.c_str(), "enable_perf_logs=%d", &value) == 1) enable_perf_logs = value != 0;
+        else if (std::sscanf(line.c_str(), "async_renderer=%d", &value) == 1) async_renderer = value != 0;
         else if (std::sscanf(line.c_str(), "ui_theme=%d", &value) == 1) ui_theme = value;
         else if (std::sscanf(line.c_str(), "ui_scale=%f", &fvalue) == 1) ui_scale = fvalue;
         if (end == std::string::npos) break;
@@ -36,12 +37,13 @@ void AppConfig::save() const {
     const int length = sceClibSnprintf(
         text,
         sizeof(text),
-        "vsync=%d\nshow_invalid_swf=%d\nremember_last_game=%d\nenable_logs=%d\nenable_perf_logs=%d\nui_theme=%d\nui_scale=%.2f\n",
+        "vsync=%d\nshow_invalid_swf=%d\nremember_last_game=%d\nenable_logs=%d\nenable_perf_logs=%d\nasync_renderer=%d\nui_theme=%d\nui_scale=%.2f\n",
         vsync ? 1 : 0,
         show_invalid_swf ? 1 : 0,
         remember_last_game ? 1 : 0,
         enable_logs ? 1 : 0,
         enable_perf_logs ? 1 : 0,
+        async_renderer ? 1 : 0,
         ui_theme,
         ui_scale);
     if (length > 0) {

@@ -177,6 +177,9 @@ void AppUi::drawSettings() {
     if (old_scale != config_.ui_scale) applyTheme();
 
     ImGui::Checkbox("VSync", &config_.vsync);
+    ImGui::Checkbox("Async render pipeline (CPU1)", &config_.async_renderer);
+    ImGui::SameLine();
+    ImGui::TextDisabled("Render frame N while CPU0 advances frame N+1");
     ImGui::Checkbox("Show SWF files with invalid/unknown headers", &config_.show_invalid_swf);
     ImGui::Checkbox("Remember last game (reserved for runtime milestone)", &config_.remember_last_game);
     const bool old_logs = config_.enable_logs;

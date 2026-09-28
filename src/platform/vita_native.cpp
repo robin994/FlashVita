@@ -31,7 +31,9 @@ bool httpFetchToFile(const char* url,
                      size_t body_len,
                      const char* content_type,
                      const char* destination,
-                     int32_t* http_status);
+                     int32_t* http_status,
+                     const std::atomic<bool>* cancel = nullptr,
+                     std::atomic<int32_t>* active_request = nullptr);
 
 namespace {
 
@@ -107,6 +109,7 @@ std::atomic<bool> g_phycont_spill_logged{false};
 std::atomic<bool> g_vram_spill_logged{false};
 std::atomic<bool> g_logging_enabled{true};
 std::atomic<bool> g_perf_logging_enabled{false};
+std::atomic<bool> g_render_core_reserved{false};
 SceUID g_rust_heap_uid = -1;
 SceClibMspace g_rust_heap = nullptr;
 std::atomic<uintptr_t> g_rust_heap_base{0};
@@ -407,6 +410,8 @@ struct NativeAudioThread {
     std::atomic<int32_t> open_result{-1};
     std::atomic<int32_t> last_error{0};
     std::atomic<uint32_t> buffers{0};
+    std::atomic<uint32_t> slow_fills{0};
+    std::atomic<uint64_t> max_fill_us{0};
     alignas(64) int16_t samples[kAudioFramesPerBuffer * kAudioChannels]{};
 };
 
@@ -419,6 +424,8 @@ struct NativeHttpJob {
     int32_t method = 0;
     std::atomic<int32_t> result{0};
     std::atomic<int32_t> status{0};
+    std::atomic<int32_t> active_request{-1};
+    std::atomic<bool> cancel{false};
 };
 
 int workerEntry(SceSize args, void* argp) {
@@ -464,7 +471,19 @@ int audioThreadEntry(SceSize args, void* argp) {
         if (state->paused.load(std::memory_order_relaxed)) {
             std::memset(state->samples, 0, sizeof(state->samples));
         } else {
+            const uint64_t fill_begin = sceKernelGetSystemTimeWide();
             state->callback(state->user, state->samples, kAudioFramesPerBuffer);
+            const uint64_t fill_us = sceKernelGetSystemTimeWide() - fill_begin;
+            uint64_t previous_max = state->max_fill_us.load(std::memory_order_relaxed);
+            while (fill_us > previous_max &&
+                   !state->max_fill_us.compare_exchange_weak(
+                       previous_max, fill_us, std::memory_order_relaxed)) {
+            }
+            constexpr uint64_t kAudioBufferBudgetUs =
+                (static_cast<uint64_t>(kAudioFramesPerBuffer) * 1000000ULL) / kAudioSampleRate;
+            if (fill_us >= kAudioBufferBudgetUs) {
+                state->slow_fills.fetch_add(1, std::memory_order_relaxed);
+            }
         }
 
         const int output_result = sceAudioOutOutput(port, state->samples);
@@ -494,7 +513,9 @@ int httpThreadEntry(SceSize args, void* argp) {
         job->body.size(),
         job->content_type.empty() ? nullptr : job->content_type.c_str(),
         job->destination.c_str(),
-        &status);
+        &status,
+        &job->cancel,
+        &job->active_request);
     job->status.store(status, std::memory_order_release);
     job->result.store(ok ? 1 : -1, std::memory_order_release);
     return ok ? 0 : -1;
@@ -670,7 +691,29 @@ void shutdown() {
 
 bool parallelFor(uint32_t count, uint32_t min_grain, ParallelCallback callback, void* user) {
     if (!callback || count == 0) return false;
-    if (!g_pool.initialized || count < min_grain || count < 3) return false;
+    if (!g_pool.initialized || count < min_grain || count < 2) return false;
+
+    if (g_render_core_reserved.load(std::memory_order_acquire)) {
+        // CPU1 is owned by the asynchronous renderer. Split work between CPU0
+        // and the CPU2 worker only, avoiding scheduler contention on the render core.
+        const uint32_t worker_end = (count + 1) / 2;
+        g_pool.callback = callback;
+        g_pool.user = user;
+        g_pool.begin[0] = g_pool.end[0] = 0;
+        g_pool.begin[1] = 0;
+        g_pool.end[1] = worker_end;
+
+        int dispatched = 0;
+        if (g_pool.work_semas[1] >= 0 && sceKernelSignalSema(g_pool.work_semas[1], 1) >= 0) {
+            dispatched = 1;
+        } else if (worker_end != 0) {
+            callback(user, 0, worker_end);
+        }
+
+        if (worker_end < count) callback(user, worker_end, count);
+        if (dispatched) sceKernelWaitSema(g_pool.done_sema, 1, nullptr);
+        return true;
+    }
 
     const uint32_t chunk = (count + 2) / 3;
     g_pool.callback = callback;
@@ -699,6 +742,14 @@ bool parallelFor(uint32_t count, uint32_t min_grain, ParallelCallback callback, 
         sceKernelWaitSema(g_pool.done_sema, dispatched_workers, nullptr);
     }
     return true;
+}
+
+void setRenderCoreReserved(bool reserved) {
+    g_render_core_reserved.store(reserved, std::memory_order_release);
+}
+
+bool renderCoreReserved() {
+    return g_render_core_reserved.load(std::memory_order_acquire);
 }
 
 bool getWorkerRuntimeStats(WorkerRuntimeStats& out) {
@@ -856,8 +907,12 @@ bool httpFetchToFile(const char* url,
                      size_t body_len,
                      const char* content_type,
                      const char* destination,
-                     int32_t* http_status) {
+                     int32_t* http_status,
+                     const std::atomic<bool>* cancel,
+                     std::atomic<int32_t>* active_request) {
     if (http_status) *http_status = 0;
+    if (active_request) active_request->store(-1, std::memory_order_release);
+    if (cancel && cancel->load(std::memory_order_acquire)) return false;
     if (!url || !destination || !ensureNetworkInitialized()) return false;
     if (!makeParentDirectories(destination)) return false;
 
@@ -885,6 +940,7 @@ bool httpFetchToFile(const char* url,
         sceHttpDeleteTemplate(tpl);
         return false;
     }
+    if (active_request) active_request->store(req, std::memory_order_release);
 
     if (content_type && content_type[0]) {
         sceHttpAddRequestHeader(req, "Content-Type", content_type, SCE_HTTP_HEADER_OVERWRITE);
@@ -895,6 +951,7 @@ bool httpFetchToFile(const char* url,
         method == 1 ? body : nullptr,
         method == 1 ? static_cast<unsigned int>(body_len) : 0);
     if (send_result < 0) {
+        if (active_request) active_request->store(-1, std::memory_order_release);
         sceHttpDeleteRequest(req);
         sceHttpDeleteConnection(conn);
         sceHttpDeleteTemplate(tpl);
@@ -906,6 +963,7 @@ bool httpFetchToFile(const char* url,
     if (http_status) *http_status = status;
     if (status < 200 || status >= 300) {
         sceHttpAbortRequest(req);
+        if (active_request) active_request->store(-1, std::memory_order_release);
         sceHttpDeleteRequest(req);
         sceHttpDeleteConnection(conn);
         sceHttpDeleteTemplate(tpl);
@@ -916,6 +974,7 @@ bool httpFetchToFile(const char* url,
     if (sceHttpGetResponseContentLength(req, &content_length) >= 0 &&
         content_length > kMaxHttpDownloadBytes) {
         sceHttpAbortRequest(req);
+        if (active_request) active_request->store(-1, std::memory_order_release);
         sceHttpDeleteRequest(req);
         sceHttpDeleteConnection(conn);
         sceHttpDeleteTemplate(tpl);
@@ -929,6 +988,7 @@ bool httpFetchToFile(const char* url,
         0666);
     if (fd < 0) {
         sceHttpAbortRequest(req);
+        if (active_request) active_request->store(-1, std::memory_order_release);
         sceHttpDeleteRequest(req);
         sceHttpDeleteConnection(conn);
         sceHttpDeleteTemplate(tpl);
@@ -939,6 +999,10 @@ bool httpFetchToFile(const char* url,
     uint64_t total_bytes = 0;
     uint8_t buffer[16 * 1024];
     for (;;) {
+        if (cancel && cancel->load(std::memory_order_acquire)) {
+            ok = false;
+            break;
+        }
         const int read = sceHttpReadData(req, buffer, sizeof(buffer));
         if (read == 0) break;
         if (read < 0 ||
@@ -958,6 +1022,7 @@ bool httpFetchToFile(const char* url,
     if (!ok) sceIoRemove(part_path.c_str());
 
     sceHttpAbortRequest(req);
+    if (active_request) active_request->store(-1, std::memory_order_release);
     sceHttpDeleteRequest(req);
     sceHttpDeleteConnection(conn);
     sceHttpDeleteTemplate(tpl);
@@ -1034,6 +1099,10 @@ extern "C" int32_t flashvita_vita_parallel_for(uint32_t count, uint32_t min_grai
     return flashvita::vita::parallelFor(count, min_grain, callback, user) ? 1 : 0;
 }
 
+extern "C" void flashvita_vita_set_render_core_reserved(int32_t reserved) {
+    flashvita::vita::setRenderCoreReserved(reserved != 0);
+}
+
 extern "C" void* flashvita_vita_audio_create(FlashVitaAudioFillCallback callback, void* user) {
     if (!callback) return nullptr;
 
@@ -1052,7 +1121,9 @@ extern "C" void* flashvita_vita_audio_create(FlashVitaAudioFillCallback callback
     // Audio must preempt transform/predecode workers to avoid underruns while
     // CPU1/CPU2 are saturated by a parallel frame job. Lower value = higher priority.
     const int audio_priority = base_priority >= 0 ? base_priority - 8 : 0x100000F8;
-    const int audio_affinity = SCE_KERNEL_CPU_MASK_USER_1 | SCE_KERNEL_CPU_MASK_USER_2;
+    const int audio_affinity = flashvita::vita::renderCoreReserved()
+        ? SCE_KERNEL_CPU_MASK_USER_2
+        : (SCE_KERNEL_CPU_MASK_USER_1 | SCE_KERNEL_CPU_MASK_USER_2);
 
     state->thread = sceKernelCreateThread(
         "FlashVitaAudio",
@@ -1101,14 +1172,16 @@ extern "C" void* flashvita_vita_audio_create(FlashVitaAudioFillCallback callback
     }
 
     char line[192];
+    const char* affinity_label = flashvita::vita::renderCoreReserved() ? "cpu2" : "cpu1|cpu2";
     sceClibSnprintf(
         line,
         sizeof(line),
-        "audio_native started port=%d hz=%u frames=%u priority=0x%08X affinity=cpu1|cpu2\n",
+        "audio_native started port=%d hz=%u frames=%u priority=0x%08X affinity=%s\n",
         open_result,
         static_cast<unsigned>(flashvita::vita::kAudioSampleRate),
         static_cast<unsigned>(flashvita::vita::kAudioFramesPerBuffer),
-        static_cast<unsigned>(audio_priority));
+        static_cast<unsigned>(audio_priority),
+        affinity_label);
     flashvita::vita::appendTextFile("ux0:data/FlashVita/runtime.log", line);
     return state;
 }
@@ -1122,7 +1195,8 @@ extern "C" int32_t flashvita_vita_audio_set_paused(void* handle, int32_t paused)
 
 extern "C" int32_t flashvita_vita_audio_get_stats(void* handle, uint64_t* buffers,
                                                     int32_t* last_error, uint64_t* run_clocks,
-                                                    int32_t* last_cpu) {
+                                                    int32_t* last_cpu, uint64_t* max_fill_us,
+                                                    uint64_t* slow_fills) {
     auto* state = static_cast<flashvita::vita::NativeAudioThread*>(handle);
     if (!state) return -1;
 
@@ -1132,6 +1206,8 @@ extern "C" int32_t flashvita_vita_audio_get_stats(void* handle, uint64_t* buffer
     if (last_error) {
         *last_error = state->last_error.load(std::memory_order_relaxed);
     }
+    if (max_fill_us) *max_fill_us = state->max_fill_us.load(std::memory_order_relaxed);
+    if (slow_fills) *slow_fills = state->slow_fills.load(std::memory_order_relaxed);
 
     SceKernelThreadInfo info{};
     info.size = sizeof(info);
@@ -1471,7 +1547,7 @@ extern "C" int32_t flashvita_vita_http_fetch_to_file(const char* url,
                                                        const char* destination,
                                                        int32_t* http_status) {
     return flashvita::vita::httpFetchToFile(
-               url, method, body, body_len, content_type, destination, http_status)
+        url, method, body, body_len, content_type, destination, http_status, nullptr, nullptr)
         ? 0
         : -1;
 }
@@ -1533,6 +1609,9 @@ extern "C" int32_t flashvita_vita_http_fetch_poll(void* handle, int32_t* http_st
 extern "C" void flashvita_vita_http_fetch_destroy(void* handle) {
     auto* job = static_cast<flashvita::vita::NativeHttpJob*>(handle);
     if (!job) return;
+    job->cancel.store(true, std::memory_order_release);
+    const int32_t request = job->active_request.load(std::memory_order_acquire);
+    if (request >= 0) sceHttpAbortRequest(request);
     if (job->thread >= 0) {
         sceKernelWaitThreadEnd(job->thread, nullptr, nullptr);
         sceKernelDeleteThread(job->thread);

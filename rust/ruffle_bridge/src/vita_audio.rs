@@ -23,6 +23,8 @@ unsafe extern "C" {
         last_error: *mut i32,
         run_clocks: *mut u64,
         last_cpu: *mut i32,
+        max_fill_us: *mut u64,
+        slow_fills: *mut u64,
     ) -> i32;
     fn flashvita_vita_audio_destroy(handle: *mut c_void);
 }
@@ -97,6 +99,8 @@ impl Drop for VitaAudioBackend {
         let mut last_error = 0i32;
         let mut run_clocks = 0u64;
         let mut last_cpu = -1i32;
+        let mut max_fill_us = 0u64;
+        let mut slow_fills = 0u64;
         unsafe {
             flashvita_vita_audio_get_stats(
                 self.native_handle,
@@ -104,11 +108,13 @@ impl Drop for VitaAudioBackend {
                 &mut last_error,
                 &mut run_clocks,
                 &mut last_cpu,
+                &mut max_fill_us,
+                &mut slow_fills,
             );
         }
         log_line(&format!(
-            "audio_backend stop buffers={} last_error=0x{:08X} run_clocks={} last_cpu={}",
-            buffers, last_error as u32, run_clocks, last_cpu
+            "audio_backend stop buffers={} last_error=0x{:08X} run_clocks={} last_cpu={} max_fill_us={} slow_fills={}",
+            buffers, last_error as u32, run_clocks, last_cpu, max_fill_us, slow_fills
         ));
 
         unsafe {

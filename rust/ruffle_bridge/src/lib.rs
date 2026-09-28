@@ -558,10 +558,13 @@ pub unsafe extern "C" fn flashvita_ruffle_headless_create(
     let ui_state = Arc::new(VitaUiState::default());
     let navigator_state = Rc::new(RefCell::new(VitaNavigatorState::new()));
     let quality = vita_game_quality(cache_root);
+    // The Vita path double-buffers VGL_RAM and swaps the texture descriptor,
+    // so BitmapData updates no longer need glTexSubImage uploads. Keep a
+    // per-game escape hatch for titles that expose a driver-specific issue.
     let zero_copy_bitmapdata = vita_navigator::native_file_size(
-        &format!("{cache_root}/zero_copy_bitmapdata"),
+        &format!("{cache_root}/disable_zero_copy_bitmapdata"),
     )
-    .is_ok();
+    .is_err();
     let Ok(navigator) = VitaNavigatorBackend::new(
         movie_url,
         cache_root.to_owned(),

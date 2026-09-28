@@ -18,6 +18,7 @@ bool initialize();
 void shutdown();
 bool parallelFor(uint32_t count, uint32_t min_grain, ParallelCallback callback, void* user);
 bool getWorkerRuntimeStats(WorkerRuntimeStats& out);
+void setRenderCoreReserved(bool reserved);
 
 bool readFile(const std::string& path, std::vector<uint8_t>& out,
               size_t max_bytes = static_cast<size_t>(-1));
@@ -41,11 +42,13 @@ typedef void (*FlashVitaParallelCallback)(void* user, uint32_t begin, uint32_t e
 typedef void (*FlashVitaAudioFillCallback)(void* user, int16_t* samples, uint32_t frames);
 int32_t flashvita_vita_parallel_for(uint32_t count, uint32_t min_grain,
                                     FlashVitaParallelCallback callback, void* user);
+void flashvita_vita_set_render_core_reserved(int32_t reserved);
 void* flashvita_vita_audio_create(FlashVitaAudioFillCallback callback, void* user);
 int32_t flashvita_vita_audio_set_paused(void* handle, int32_t paused);
 int32_t flashvita_vita_audio_get_stats(void* handle, uint64_t* buffers,
                                        int32_t* last_error, uint64_t* run_clocks,
-                                       int32_t* last_cpu);
+                                       int32_t* last_cpu, uint64_t* max_fill_us,
+                                       uint64_t* slow_fills);
 void flashvita_vita_audio_destroy(void* handle);
 int64_t flashvita_vita_file_size(const char* path);
 int32_t flashvita_vita_file_read(const char* path, uint8_t* dst, size_t capacity);

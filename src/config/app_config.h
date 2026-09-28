@@ -8,6 +8,7 @@ struct AppConfig {
     bool remember_last_game = true;
     bool enable_logs = false;
     bool enable_perf_logs = false;
+    bool async_renderer = true;
     int ui_theme = 0;
     float ui_scale = 1.0f;
 

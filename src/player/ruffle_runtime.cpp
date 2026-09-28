@@ -113,6 +113,21 @@ int32_t flashvita_ruffle_virtual_keyboard_ack(void* handle);
 int32_t flashvita_ruffle_replace_focused_text(void* handle, const uint8_t* data, size_t len);
 void flashvita_ruffle_headless_destroy(void* handle);
 int32_t flashvita_ruffle_renderer_stats(FlashVitaRendererStats* out);
+void flashvita_vitagl_set_async_pipeline(int32_t enabled);
+int32_t flashvita_vitagl_commit_flash_frame(uint8_t present);
+void flashvita_vitagl_wait_render_idle();
+void flashvita_vitagl_async_shutdown();
+void flashvita_vitagl_async_stats(uint64_t* submitted,
+                                  uint64_t* executed,
+                                  uint64_t* waits,
+                                  uint64_t* native_draws,
+                                  uint64_t* fallback_draws,
+                                  uint64_t* native_texture_updates,
+                                  uint64_t* gl_texture_updates,
+                                  uint64_t* native_mask_ops,
+                                  uint64_t* gl_mask_ops,
+                                  uint64_t* native_offscreen_passes,
+                                  uint64_t* gl_offscreen_passes);
 }
 #endif
 
@@ -332,6 +347,29 @@ void logRendererStats(const char* reason) {
     static uint64_t previous_worker_clocks[2]{};
     flashvita::vita::WorkerRuntimeStats worker_stats{};
     flashvita::vita::getWorkerRuntimeStats(worker_stats);
+    uint64_t async_submitted = 0;
+    uint64_t async_executed = 0;
+    uint64_t async_waits = 0;
+    uint64_t native_draws = 0;
+    uint64_t fallback_draws = 0;
+    uint64_t native_texture_updates = 0;
+    uint64_t gl_texture_updates = 0;
+    uint64_t native_mask_ops = 0;
+    uint64_t gl_mask_ops = 0;
+    uint64_t native_offscreen_passes = 0;
+    uint64_t gl_offscreen_passes = 0;
+    flashvita_vitagl_async_stats(
+        &async_submitted,
+        &async_executed,
+        &async_waits,
+        &native_draws,
+        &fallback_draws,
+        &native_texture_updates,
+        &gl_texture_updates,
+        &native_mask_ops,
+        &gl_mask_ops,
+        &native_offscreen_passes,
+        &gl_offscreen_passes);
     const uint64_t worker0_delta =
         worker_stats.run_clocks[0] >= previous_worker_clocks[0]
             ? worker_stats.run_clocks[0] - previous_worker_clocks[0]
@@ -343,7 +381,7 @@ void logRendererStats(const char* reason) {
     previous_worker_clocks[0] = worker_stats.run_clocks[0];
     previous_worker_clocks[1] = worker_stats.run_clocks[1];
 
-    char line[768];
+    char line[1200];
     const int length = sceClibSnprintf(
         line,
         sizeof(line),
@@ -352,7 +390,10 @@ void logRendererStats(const char* reason) {
         "lines=%llu gradient_skip=%llu missing_bitmap=%llu mask_ops=%llu blends=%llu stage3d=%llu "
         "xform_vertices=%llu parallel_draws=%llu parallel_batches=%llu parallel_jobs=%llu "
         "color_submissions=%llu prepass_us=%llu submit_us=%llu "
-        "worker_clk_delta=%llu,%llu worker_last_cpu=%d,%d\n",
+        "worker_clk_delta=%llu,%llu worker_last_cpu=%d,%d "
+        "async_submitted=%llu async_executed=%llu async_waits=%llu "
+        "native_draws=%llu fallback_draws=%llu native_tex_updates=%llu gl_tex_updates=%llu "
+        "native_mask_ops=%llu gl_mask_ops=%llu native_offscreen=%llu gl_offscreen=%llu\n",
         reason ? reason : "periodic",
         static_cast<unsigned long long>(stats.frames),
         static_cast<unsigned long long>(stats.colored_draws),
@@ -376,7 +417,18 @@ void logRendererStats(const char* reason) {
         static_cast<unsigned long long>(worker0_delta),
         static_cast<unsigned long long>(worker1_delta),
         worker_stats.last_cpu[0],
-        worker_stats.last_cpu[1]);
+        worker_stats.last_cpu[1],
+        static_cast<unsigned long long>(async_submitted),
+        static_cast<unsigned long long>(async_executed),
+        static_cast<unsigned long long>(async_waits),
+        static_cast<unsigned long long>(native_draws),
+        static_cast<unsigned long long>(fallback_draws),
+        static_cast<unsigned long long>(native_texture_updates),
+        static_cast<unsigned long long>(gl_texture_updates),
+        static_cast<unsigned long long>(native_mask_ops),
+        static_cast<unsigned long long>(gl_mask_ops),
+        static_cast<unsigned long long>(native_offscreen_passes),
+        static_cast<unsigned long long>(gl_offscreen_passes));
     if (length > 0) {
         vita::appendFile(
             "ux0:data/FlashVita/runtime.log",
@@ -447,6 +499,35 @@ const char* RuffleRuntime::bridgeVersion() {
 void RuffleRuntime::prepareUiGraphics() {
 #if FLASHVITA_ENABLE_RUFFLE
     flashvita_vitagl_prepare_ui();
+#endif
+}
+
+void RuffleRuntime::setAsyncRendererEnabled(bool enabled) {
+#if FLASHVITA_ENABLE_RUFFLE
+    flashvita_vitagl_set_async_pipeline(enabled ? 1 : 0);
+#else
+    (void)enabled;
+#endif
+}
+
+bool RuffleRuntime::commitAsyncFrame(bool present) {
+#if FLASHVITA_ENABLE_RUFFLE
+    return flashvita_vitagl_commit_flash_frame(present ? 1 : 0) > 0;
+#else
+    (void)present;
+    return false;
+#endif
+}
+
+void RuffleRuntime::waitAsyncRenderer() {
+#if FLASHVITA_ENABLE_RUFFLE
+    flashvita_vitagl_wait_render_idle();
+#endif
+}
+
+void RuffleRuntime::shutdownAsyncRenderer() {
+#if FLASHVITA_ENABLE_RUFFLE
+    flashvita_vitagl_async_shutdown();
 #endif
 }
 
@@ -760,6 +841,7 @@ void RuffleRuntime::stop() {
         logMemoryStats("stop_before");
         // Ensure the GPU is no longer consuming resources owned by the current
         // player before its texture handles are destroyed.
+        waitAsyncRenderer();
         glFinish();
         flashvita_ruffle_headless_destroy(handle_);
         handle_ = nullptr;

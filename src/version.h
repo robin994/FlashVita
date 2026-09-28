@@ -1,5 +1,5 @@
 #pragma once
 
-#define FLASHVITA_VERSION "0.15.29"
+#define FLASHVITA_VERSION "0.15.31"
 #define FLASHVITA_VERSION_LABEL "v" FLASHVITA_VERSION
-#define FLASHVITA_BUILD_TAG "visual-fbo-fix"
+#define FLASHVITA_BUILD_TAG "alpha.1"
