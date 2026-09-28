@@ -23,12 +23,16 @@
 #include <psp2/sysmodule.h>
 
 extern "C" unsigned int _get_vita_heap_size(void);
-extern "C" void* __real_malloc(size_t size);
-extern "C" void* __real_calloc(size_t count, size_t size);
-extern "C" void* __real_realloc(void* ptr, size_t size);
-extern "C" void __real_free(void* ptr);
-
 namespace flashvita::vita {
+
+bool httpFetchToFile(const char* url,
+                     int32_t method,
+                     const uint8_t* body,
+                     size_t body_len,
+                     const char* content_type,
+                     const char* destination,
+                     int32_t* http_status);
+
 namespace {
 
 constexpr int kWorkerCount = 2;
@@ -45,6 +49,10 @@ constexpr int kNetPoolSize = 2 * 1024 * 1024;
 constexpr unsigned kHttpPoolSize = 2 * 1024 * 1024;
 constexpr unsigned kSslPoolSize = 2 * 1024 * 1024;
 constexpr uint64_t kMaxHttpDownloadBytes = 128ULL * 1024ULL * 1024ULL;
+constexpr size_t kLogSlotCount = 128;
+constexpr size_t kLogSlotBytes = 512;
+constexpr SceSize kLogThreadStackSize = 64 * 1024;
+constexpr SceSize kHttpThreadStackSize = 256 * 1024;
 
 struct NativeWorkerPool;
 
@@ -69,6 +77,17 @@ struct NativeWorkerPool {
 };
 
 NativeWorkerPool g_pool;
+SceUID g_log_thread = -1;
+SceUID g_log_sema = -1;
+std::atomic<bool> g_log_thread_started{false};
+std::atomic<bool> g_log_stopping{false};
+std::atomic_flag g_log_lock = ATOMIC_FLAG_INIT;
+char g_log_slots[kLogSlotCount][kLogSlotBytes]{};
+uint16_t g_log_lengths[kLogSlotCount]{};
+size_t g_log_head = 0;
+size_t g_log_tail = 0;
+size_t g_log_count = 0;
+std::atomic<uint64_t> g_log_dropped{0};
 alignas(64) uint8_t g_net_memory[kNetPoolSize];
 bool g_network_initialized = false;
 bool g_network_attempted = false;
@@ -88,16 +107,172 @@ std::atomic<bool> g_phycont_spill_logged{false};
 std::atomic<bool> g_vram_spill_logged{false};
 std::atomic<bool> g_logging_enabled{true};
 std::atomic<bool> g_perf_logging_enabled{false};
+SceUID g_rust_heap_uid = -1;
+SceClibMspace g_rust_heap = nullptr;
+std::atomic<uintptr_t> g_rust_heap_base{0};
+std::atomic<uintptr_t> g_rust_heap_end{0};
+std::atomic_flag g_rust_heap_lock = ATOMIC_FLAG_INIT;
 
-void rustAllocatorLog(const char* line) {
-    if (!line || !g_logging_enabled.load(std::memory_order_relaxed)) return;
+void rustHeapLock() {
+    while (g_rust_heap_lock.test_and_set(std::memory_order_acquire)) {
+        sceKernelDelayThread(0);
+    }
+}
+
+void rustHeapUnlock() {
+    g_rust_heap_lock.clear(std::memory_order_release);
+}
+
+bool isRustHeapPointer(const void* ptr) {
+    if (!ptr) return false;
+    const uintptr_t address = reinterpret_cast<uintptr_t>(ptr);
+    const uintptr_t base = g_rust_heap_base.load(std::memory_order_acquire);
+    const uintptr_t end = g_rust_heap_end.load(std::memory_order_acquire);
+    return base != 0 && address >= base && address < end;
+}
+
+void logLock() {
+    while (g_log_lock.test_and_set(std::memory_order_acquire)) {
+        sceKernelDelayThread(0);
+    }
+}
+
+void logUnlock() {
+    g_log_lock.clear(std::memory_order_release);
+}
+
+bool writeAllRaw(SceUID fd, const uint8_t* data, size_t bytes) {
+    size_t written = 0;
+    while (written < bytes) {
+        const int result = sceIoWrite(fd, data + written, bytes - written);
+        if (result <= 0) return false;
+        written += static_cast<size_t>(result);
+    }
+    return true;
+}
+
+int logThreadEntry(SceSize, void*) {
     const SceUID fd = sceIoOpen(
         kRuntimeLogPath,
         SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND,
         0666);
-    if (fd < 0) return;
-    sceIoWrite(fd, line, static_cast<SceSize>(std::strlen(line)));
-    sceIoClose(fd);
+    if (fd < 0) return fd;
+
+    char local[kLogSlotBytes];
+    for (;;) {
+        sceKernelWaitSema(g_log_sema, 1, nullptr);
+        for (;;) {
+            size_t length = 0;
+            logLock();
+            if (g_log_count != 0) {
+                length = g_log_lengths[g_log_head];
+                std::memcpy(local, g_log_slots[g_log_head], length);
+                g_log_head = (g_log_head + 1) % kLogSlotCount;
+                --g_log_count;
+            }
+            const bool stopping = g_log_stopping.load(std::memory_order_acquire);
+            logUnlock();
+
+            if (length != 0) {
+                writeAllRaw(fd, reinterpret_cast<const uint8_t*>(local), length);
+                continue;
+            }
+            if (stopping) {
+                sceIoClose(fd);
+                return 0;
+            }
+            break;
+        }
+    }
+}
+
+void startLogThread() {
+    if (!g_logging_enabled.load(std::memory_order_acquire) ||
+        g_log_thread_started.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    g_log_sema = sceKernelCreateSema("FlashVitaLog", 0, 0, kLogSlotCount, nullptr);
+    if (g_log_sema < 0) return;
+
+    const int base_priority = sceKernelGetThreadCurrentPriority();
+    const int log_priority = base_priority >= 0 ? base_priority + 16 : 0x10000110;
+    g_log_thread = sceKernelCreateThread(
+        "FlashVitaLog",
+        logThreadEntry,
+        log_priority,
+        kLogThreadStackSize,
+        0,
+        SCE_KERNEL_CPU_MASK_USER_2,
+        nullptr);
+    if (g_log_thread < 0) {
+        sceKernelDeleteSema(g_log_sema);
+        g_log_sema = -1;
+        return;
+    }
+
+    g_log_stopping.store(false, std::memory_order_release);
+    if (sceKernelStartThread(g_log_thread, 0, nullptr) < 0) {
+        sceKernelDeleteThread(g_log_thread);
+        sceKernelDeleteSema(g_log_sema);
+        g_log_thread = -1;
+        g_log_sema = -1;
+        return;
+    }
+    g_log_thread_started.store(true, std::memory_order_release);
+}
+
+void stopLogThread() {
+    if (!g_log_thread_started.exchange(false, std::memory_order_acq_rel)) return;
+    g_log_stopping.store(true, std::memory_order_release);
+    sceKernelSignalSema(g_log_sema, 1);
+    sceKernelWaitThreadEnd(g_log_thread, nullptr, nullptr);
+    sceKernelDeleteThread(g_log_thread);
+    sceKernelDeleteSema(g_log_sema);
+    g_log_thread = -1;
+    g_log_sema = -1;
+}
+
+bool enqueueRuntimeLog(const void* data, size_t bytes) {
+    if (!data || bytes == 0) return true;
+    if (!g_logging_enabled.load(std::memory_order_relaxed)) return true;
+
+    if (!g_log_thread_started.load(std::memory_order_acquire)) {
+        const SceUID fd = sceIoOpen(
+            kRuntimeLogPath,
+            SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND,
+            0666);
+        if (fd < 0) return false;
+        const bool ok = writeAllRaw(fd, static_cast<const uint8_t*>(data), bytes);
+        sceIoClose(fd);
+        return ok;
+    }
+
+    const uint8_t* input = static_cast<const uint8_t*>(data);
+    while (bytes != 0) {
+        const size_t chunk = std::min(bytes, kLogSlotBytes - 1);
+        bool queued = false;
+        logLock();
+        if (g_log_count < kLogSlotCount) {
+            std::memcpy(g_log_slots[g_log_tail], input, chunk);
+            g_log_lengths[g_log_tail] = static_cast<uint16_t>(chunk);
+            g_log_tail = (g_log_tail + 1) % kLogSlotCount;
+            ++g_log_count;
+            queued = true;
+        } else {
+            g_log_dropped.fetch_add(1, std::memory_order_relaxed);
+        }
+        logUnlock();
+        if (queued) sceKernelSignalSema(g_log_sema, 1);
+        input += chunk;
+        bytes -= chunk;
+    }
+    return true;
+}
+
+void rustAllocatorLog(const char* line) {
+    if (!line || !g_logging_enabled.load(std::memory_order_relaxed)) return;
+    enqueueRuntimeLog(line, std::strlen(line));
 }
 
 bool rustAllocatorShouldSpill(size_t bytes) {
@@ -211,7 +386,7 @@ void enterRustAllocatorSpillMode() {
 void releaseRustNewlibReserve() {
     void* reserve = g_rust_newlib_reserve.exchange(nullptr, std::memory_order_acq_rel);
     if (!reserve) return;
-    __real_free(reserve);
+    std::free(reserve);
 
     char line[160];
     sceClibSnprintf(
@@ -233,6 +408,17 @@ struct NativeAudioThread {
     std::atomic<int32_t> last_error{0};
     std::atomic<uint32_t> buffers{0};
     alignas(64) int16_t samples[kAudioFramesPerBuffer * kAudioChannels]{};
+};
+
+struct NativeHttpJob {
+    SceUID thread = -1;
+    std::string url;
+    std::vector<uint8_t> body;
+    std::string content_type;
+    std::string destination;
+    int32_t method = 0;
+    std::atomic<int32_t> result{0};
+    std::atomic<int32_t> status{0};
 };
 
 int workerEntry(SceSize args, void* argp) {
@@ -292,6 +478,26 @@ int audioThreadEntry(SceSize args, void* argp) {
     sceAudioOutOutput(port, nullptr);
     sceAudioOutReleasePort(port);
     return 0;
+}
+
+int httpThreadEntry(SceSize args, void* argp) {
+    (void)args;
+    if (!argp) return -1;
+    auto* job = *static_cast<NativeHttpJob**>(argp);
+    if (!job) return -2;
+
+    int32_t status = 0;
+    const bool ok = httpFetchToFile(
+        job->url.c_str(),
+        job->method,
+        job->body.empty() ? nullptr : job->body.data(),
+        job->body.size(),
+        job->content_type.empty() ? nullptr : job->content_type.c_str(),
+        job->destination.c_str(),
+        &status);
+    job->status.store(status, std::memory_order_release);
+    job->result.store(ok ? 1 : -1, std::memory_order_release);
+    return ok ? 0 : -1;
 }
 
 void destroyPool() {
@@ -389,6 +595,7 @@ bool makeParentDirectories(const std::string& file_path) {
 bool initialize() {
     if (g_pool.initialized) return true;
 
+    startLogThread();
     appendTextFile(kRuntimeLogPath, "native_init begin\n");
 
     g_pool.done_sema = sceKernelCreateSema("FlashVitaDone", 0, 0, kWorkerCount, nullptr);
@@ -458,6 +665,7 @@ bool initialize() {
 void shutdown() {
     shutdownNetwork();
     destroyPool();
+    stopLogThread();
 }
 
 bool parallelFor(uint32_t count, uint32_t min_grain, ParallelCallback callback, void* user) {
@@ -589,6 +797,9 @@ bool writeTextFile(const std::string& path, const std::string& text) {
 bool appendFile(const std::string& path, const void* data, size_t bytes) {
     if (path == kRuntimeLogPath && !g_logging_enabled.load(std::memory_order_relaxed)) {
         return true;
+    }
+    if (path == kRuntimeLogPath) {
+        return enqueueRuntimeLog(data, bytes);
     }
     const SceUID fd = sceIoOpen(path.c_str(), SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0666);
     if (fd < 0) return false;
@@ -764,14 +975,14 @@ extern "C" void* __wrap_malloc(size_t bytes) {
     }
 
     if (!flashvita::vita::g_rust_allocator_spill.load(std::memory_order_acquire)) {
-        if (void* ptr = __real_malloc(bytes)) return ptr;
+        if (void* ptr = std::malloc(bytes)) return ptr;
         if (!vgl_ready) return nullptr;
         flashvita::vita::enterRustAllocatorSpillMode();
     }
 
     if (void* ptr = flashvita::vita::allocateVglManaged(bytes)) return ptr;
     flashvita::vita::releaseRustNewlibReserve();
-    return __real_malloc(bytes);
+    return std::malloc(bytes);
 }
 
 extern "C" void* __wrap_calloc(size_t count, size_t size) {
@@ -788,7 +999,7 @@ extern "C" void __wrap_free(void* ptr) {
     if (flashvita::vita::isVglManagedPointer(ptr)) {
         vglFree(ptr);
     } else {
-        __real_free(ptr);
+        std::free(ptr);
     }
 }
 
@@ -801,7 +1012,7 @@ extern "C" void* __wrap_realloc(void* ptr, size_t new_size) {
 
     if (!flashvita::vita::isVglManagedPointer(ptr) &&
         !flashvita::vita::g_rust_allocator_spill.load(std::memory_order_acquire)) {
-        if (void* resized = __real_realloc(ptr, new_size)) return resized;
+        if (void* resized = std::realloc(ptr, new_size)) return resized;
         if (!flashvita::vita::g_rust_allocator_vgl_ready.load(std::memory_order_acquire)) {
             return nullptr;
         }
@@ -838,7 +1049,9 @@ extern "C" void* flashvita_vita_audio_create(FlashVitaAudioFillCallback callback
     }
 
     const int base_priority = sceKernelGetThreadCurrentPriority();
-    const int audio_priority = base_priority >= 0 ? base_priority + 1 : 0x10000101;
+    // Audio must preempt transform/predecode workers to avoid underruns while
+    // CPU1/CPU2 are saturated by a parallel frame job. Lower value = higher priority.
+    const int audio_priority = base_priority >= 0 ? base_priority - 8 : 0x100000F8;
     const int audio_affinity = SCE_KERNEL_CPU_MASK_USER_1 | SCE_KERNEL_CPU_MASK_USER_2;
 
     state->thread = sceKernelCreateThread(
@@ -1088,99 +1301,106 @@ extern "C" int32_t flashvita_vita_memblock_free(int32_t uid, void* base) {
 
 extern "C" void* flashvita_vita_vgl_ram_alloc(size_t bytes) {
     if (bytes == 0 || bytes > static_cast<size_t>(UINT32_MAX)) return nullptr;
-    return vglAlloc(static_cast<uint32_t>(bytes), VGL_MEM_RAM);
+    void* ptr = vglAlloc(static_cast<uint32_t>(bytes), VGL_MEM_RAM);
+    if (ptr && flashvita::vita::g_vgl_ram_base.load(std::memory_order_acquire) == 0) {
+        SceKernelMemBlockInfo info{};
+        info.size = sizeof(info);
+        if (sceKernelGetMemBlockInfoByAddr(ptr, &info) >= 0 && info.mappedBase && info.mappedSize) {
+            const uintptr_t base = reinterpret_cast<uintptr_t>(info.mappedBase);
+            flashvita::vita::g_vgl_ram_base.store(base, std::memory_order_release);
+            flashvita::vita::g_vgl_ram_end.store(base + info.mappedSize, std::memory_order_release);
+        }
+    }
+    return ptr;
 }
 
 extern "C" void flashvita_vita_vgl_ram_free(void* base) {
     if (base) vglFree(base);
 }
 
-extern "C" void flashvita_vita_rust_allocator_enable_vgl(void) {
-    if (flashvita::vita::g_rust_allocator_vgl_ready.load(std::memory_order_acquire)) return;
+extern "C" int32_t flashvita_vita_vgl_ram_owns(const void* ptr) {
+    if (!ptr) return 0;
+    const uintptr_t address = reinterpret_cast<uintptr_t>(ptr);
+    const uintptr_t base = flashvita::vita::g_vgl_ram_base.load(std::memory_order_acquire);
+    const uintptr_t end = flashvita::vita::g_vgl_ram_end.load(std::memory_order_acquire);
+    return base != 0 && address >= base && address < end ? 1 : 0;
+}
 
-    void* pool_probe = vglAlloc(64, VGL_MEM_RAM);
-    if (pool_probe) {
-        SceKernelMemBlockInfo info{};
-        info.size = sizeof(info);
-        if (sceKernelGetMemBlockInfoByAddr(pool_probe, &info) >= 0 && info.mappedBase && info.mappedSize) {
-            const uintptr_t base = reinterpret_cast<uintptr_t>(info.mappedBase);
-            flashvita::vita::g_vgl_ram_base.store(base, std::memory_order_release);
-            flashvita::vita::g_vgl_ram_end.store(base + info.mappedSize, std::memory_order_release);
+extern "C" void flashvita_vita_rust_allocator_init_cached(void) {
+    if (flashvita::vita::g_rust_heap != nullptr) return;
+
+    static constexpr size_t kCandidateSizes[] = {
+        64u * 1024u * 1024u,
+        48u * 1024u * 1024u,
+        32u * 1024u * 1024u,
+    };
+    static constexpr SceKernelMemBlockType kTypes[] = {
+        SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_GAME_RW,
+        SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_RW,
+    };
+
+    for (size_t bytes : kCandidateSizes) {
+        for (SceKernelMemBlockType type : kTypes) {
+            const SceUID uid = sceKernelAllocMemBlock(
+                "FlashVitaRustHeap", type, static_cast<SceSize>(bytes), nullptr);
+            if (uid < 0) continue;
+
+            void* base = nullptr;
+            if (sceKernelGetMemBlockBase(uid, &base) < 0 || !base) {
+                sceKernelFreeMemBlock(uid);
+                continue;
+            }
+
+            SceClibMspace mspace = sceClibMspaceCreate(base, static_cast<SceSize>(bytes));
+            if (!mspace) {
+                sceKernelFreeMemBlock(uid);
+                continue;
+            }
+
+            flashvita::vita::g_rust_heap_uid = uid;
+            flashvita::vita::g_rust_heap = mspace;
+            const uintptr_t begin = reinterpret_cast<uintptr_t>(base);
+            flashvita::vita::g_rust_heap_base.store(begin, std::memory_order_release);
+            flashvita::vita::g_rust_heap_end.store(begin + bytes, std::memory_order_release);
+
+            char line[192];
+            sceClibSnprintf(
+                line,
+                sizeof(line),
+                "rust_allocator dedicated_cached=1 bytes=%u uid=%d type=0x%08X base=%p\n",
+                static_cast<unsigned>(bytes),
+                uid,
+                static_cast<unsigned>(type),
+                base);
+            flashvita::vita::rustAllocatorLog(line);
+            return;
         }
-        vglFree(pool_probe);
     }
 
-    pool_probe = vglAlloc(64, VGL_MEM_PHYCONT);
-    if (pool_probe) {
-        SceKernelMemBlockInfo info{};
-        info.size = sizeof(info);
-        if (sceKernelGetMemBlockInfoByAddr(pool_probe, &info) >= 0 && info.mappedBase && info.mappedSize) {
-            const uintptr_t base = reinterpret_cast<uintptr_t>(info.mappedBase);
-            flashvita::vita::g_vgl_phycont_base.store(base, std::memory_order_release);
-            flashvita::vita::g_vgl_phycont_end.store(base + info.mappedSize, std::memory_order_release);
-        }
-        vglFree(pool_probe);
-    }
-
-    void* reserve = __real_malloc(flashvita::vita::kRustNewlibEmergencyReserve);
-    if (reserve) {
-        SceKernelMemBlockInfo info{};
-        info.size = sizeof(info);
-        if (sceKernelGetMemBlockInfoByAddr(reserve, &info) >= 0 && info.mappedBase && info.mappedSize) {
-            const uintptr_t base = reinterpret_cast<uintptr_t>(info.mappedBase);
-            flashvita::vita::g_newlib_memblock_base.store(base, std::memory_order_release);
-            flashvita::vita::g_newlib_memblock_end.store(base + info.mappedSize, std::memory_order_release);
-        }
-    }
-    flashvita::vita::g_rust_newlib_reserve.store(reserve, std::memory_order_release);
-    flashvita::vita::g_rust_allocator_vgl_ready.store(true, std::memory_order_release);
-    // After vitaGL owns a stable RAM pool, preserve newlib for libc/pthread and
-    // route application/Ruffle allocations to VGL RAM first.
-    flashvita::vita::enterRustAllocatorSpillMode();
-
-    char line[192];
-    sceClibSnprintf(
-        line,
-        sizeof(line),
-        "rust_allocator hybrid=1 reserve=%u reserve_ok=%d newlib_block=0x%08X-0x%08X vgl_ram_free=%llu phycont_free=%llu\n",
-        static_cast<unsigned>(flashvita::vita::kRustNewlibEmergencyReserve),
-        reserve ? 1 : 0,
-        static_cast<unsigned>(flashvita::vita::g_newlib_memblock_base.load(std::memory_order_acquire)),
-        static_cast<unsigned>(flashvita::vita::g_newlib_memblock_end.load(std::memory_order_acquire)),
-        static_cast<unsigned long long>(vglMemFree(VGL_MEM_RAM)),
-        static_cast<unsigned long long>(vglMemFree(VGL_MEM_PHYCONT)));
-    flashvita::vita::rustAllocatorLog(line);
+    flashvita::vita::rustAllocatorLog(
+        "rust_allocator dedicated_cached=0 fallback=newlib\n");
 }
 
 extern "C" void* flashvita_vita_rust_alloc(size_t bytes, size_t alignment) {
     if (bytes == 0) bytes = 1;
     if (alignment < sizeof(void*)) alignment = sizeof(void*);
 
-    const bool vgl_ready = flashvita::vita::g_rust_allocator_vgl_ready.load(std::memory_order_acquire);
-    if (vgl_ready && flashvita::vita::rustAllocatorShouldSpill(bytes)) {
-        flashvita::vita::enterRustAllocatorSpillMode();
-    }
-    if (!flashvita::vita::g_rust_allocator_spill.load(std::memory_order_acquire)) {
+    if (flashvita::vita::g_rust_heap &&
+        bytes <= static_cast<size_t>(UINT32_MAX) &&
+        alignment <= static_cast<size_t>(UINT32_MAX)) {
+        flashvita::vita::rustHeapLock();
         void* ptr = alignment <= alignof(std::max_align_t)
-            ? std::malloc(bytes)
-            : memalign(alignment, bytes);
+            ? sceClibMspaceMalloc(flashvita::vita::g_rust_heap, static_cast<SceSize>(bytes))
+            : sceClibMspaceMemalign(
+                  flashvita::vita::g_rust_heap,
+                  static_cast<SceSize>(alignment),
+                  static_cast<SceSize>(bytes));
+        flashvita::vita::rustHeapUnlock();
         if (ptr) return ptr;
-        if (!vgl_ready) return nullptr;
-        flashvita::vita::enterRustAllocatorSpillMode();
     }
 
-    if (bytes > static_cast<size_t>(UINT32_MAX) || alignment > static_cast<size_t>(UINT32_MAX)) {
-        return nullptr;
-    }
-
-    void* ptr = alignment <= 16
-        ? flashvita::vita::allocateVglManaged(bytes)
-        : memalign(alignment, bytes);
-    if (ptr) return ptr;
-
-    flashvita::vita::releaseRustNewlibReserve();
     return alignment <= alignof(std::max_align_t)
-        ? __real_malloc(bytes)
+        ? std::malloc(bytes)
         : memalign(alignment, bytes);
 }
 
@@ -1198,6 +1418,25 @@ extern "C" void* flashvita_vita_rust_realloc(void* ptr, size_t old_size, size_t 
         return nullptr;
     }
 
+    if (flashvita::vita::isRustHeapPointer(ptr) && flashvita::vita::g_rust_heap &&
+        new_size <= static_cast<size_t>(UINT32_MAX) &&
+        alignment <= static_cast<size_t>(UINT32_MAX)) {
+        flashvita::vita::rustHeapLock();
+        void* resized = alignment <= alignof(std::max_align_t)
+            ? sceClibMspaceRealloc(
+                  flashvita::vita::g_rust_heap, ptr, static_cast<SceSize>(new_size))
+            : sceClibMspaceReallocalign(
+                  flashvita::vita::g_rust_heap,
+                  ptr,
+                  static_cast<SceSize>(new_size),
+                  static_cast<SceSize>(alignment));
+        flashvita::vita::rustHeapUnlock();
+        if (resized) return resized;
+    } else if (!flashvita::vita::isRustHeapPointer(ptr) &&
+               alignment <= alignof(std::max_align_t)) {
+        if (void* resized = std::realloc(ptr, new_size)) return resized;
+    }
+
     void* replacement = flashvita_vita_rust_alloc(new_size, alignment);
     if (!replacement) return nullptr;
     std::memcpy(replacement, ptr, std::min(old_size, new_size));
@@ -1207,10 +1446,12 @@ extern "C" void* flashvita_vita_rust_realloc(void* ptr, size_t old_size, size_t 
 
 extern "C" void flashvita_vita_rust_dealloc(void* ptr) {
     if (!ptr) return;
-    if (flashvita::vita::isVglManagedPointer(ptr)) {
-        vglFree(ptr);
+    if (flashvita::vita::isRustHeapPointer(ptr) && flashvita::vita::g_rust_heap) {
+        flashvita::vita::rustHeapLock();
+        sceClibMspaceFree(flashvita::vita::g_rust_heap, ptr);
+        flashvita::vita::rustHeapUnlock();
     } else {
-        __real_free(ptr);
+        std::free(ptr);
     }
 }
 
@@ -1233,6 +1474,71 @@ extern "C" int32_t flashvita_vita_http_fetch_to_file(const char* url,
                url, method, body, body_len, content_type, destination, http_status)
         ? 0
         : -1;
+}
+
+extern "C" void* flashvita_vita_http_fetch_start(const char* url,
+                                                   int32_t method,
+                                                   const uint8_t* body,
+                                                   size_t body_len,
+                                                   const char* content_type,
+                                                   const char* destination) {
+    if (!url || !destination || (body_len != 0 && !body)) return nullptr;
+
+    auto* job = new (std::nothrow) flashvita::vita::NativeHttpJob();
+    if (!job) return nullptr;
+    try {
+        job->url = url;
+        job->method = method;
+        if (body_len != 0) job->body.assign(body, body + body_len);
+        if (content_type) job->content_type = content_type;
+        job->destination = destination;
+    } catch (...) {
+        delete job;
+        return nullptr;
+    }
+
+    const int base_priority = sceKernelGetThreadCurrentPriority();
+    const int io_priority = base_priority >= 0 ? base_priority + 12 : 0x1000010C;
+    job->thread = sceKernelCreateThread(
+        "FlashVitaHttp",
+        flashvita::vita::httpThreadEntry,
+        io_priority,
+        flashvita::vita::kHttpThreadStackSize,
+        0,
+        SCE_KERNEL_CPU_MASK_USER_2,
+        nullptr);
+    if (job->thread < 0) {
+        delete job;
+        return nullptr;
+    }
+
+    auto* arg = job;
+    if (sceKernelStartThread(job->thread, sizeof(arg), &arg) < 0) {
+        sceKernelDeleteThread(job->thread);
+        delete job;
+        return nullptr;
+    }
+    return job;
+}
+
+extern "C" int32_t flashvita_vita_http_fetch_poll(void* handle, int32_t* http_status) {
+    auto* job = static_cast<flashvita::vita::NativeHttpJob*>(handle);
+    if (!job) return -2;
+    if (http_status) {
+        *http_status = job->status.load(std::memory_order_acquire);
+    }
+    return job->result.load(std::memory_order_acquire);
+}
+
+extern "C" void flashvita_vita_http_fetch_destroy(void* handle) {
+    auto* job = static_cast<flashvita::vita::NativeHttpJob*>(handle);
+    if (!job) return;
+    if (job->thread >= 0) {
+        sceKernelWaitThreadEnd(job->thread, nullptr, nullptr);
+        sceKernelDeleteThread(job->thread);
+        job->thread = -1;
+    }
+    delete job;
 }
 
 extern "C" void flashvita_vita_log_line(const char* line) {

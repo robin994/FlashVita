@@ -7,6 +7,10 @@ publish = false
 [lib]
 crate-type = ["staticlib"]
 
+[features]
+default = []
+vita-profile = ["ruffle_core/vita-profile"]
+
 [dependencies]
 ruffle_core = { path = "../../third_party/ruffle/core", default-features = false, features = ["audio", "mp3", "aac", "nellymoser", "lzma"] }
 ruffle_render = { path = "../../third_party/ruffle/render", default-features = false, features = ["tessellator"] }
@@ -18,7 +22,7 @@ indexmap = "2"
 
 [profile.release]
 panic = "abort"
-lto = "thin"
+lto = "fat"
 codegen-units = 1
-opt-level = 2
+opt-level = 3
 

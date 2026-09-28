@@ -37,6 +37,7 @@ public:
     bool probeFile(const std::string& path, RuffleProbeInfo& out);
     bool startHeadless(const std::string& path, RuffleProbeInfo& out);
     bool tick(double dt_ms);
+    bool renderNow();
     bool keyEvent(int key, bool down);
     bool mouseMove(double x, double y);
     bool mouseButton(double x, double y, bool down);

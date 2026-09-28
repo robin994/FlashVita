@@ -11,6 +11,7 @@ use ruffle_core::socket::{ConnectionState, SocketAction, SocketHandle};
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::ffi::{c_char, CString};
+use std::ffi::c_void;
 use std::future::Future;
 use std::io::{self, Read};
 use std::pin::Pin;
@@ -28,17 +29,73 @@ unsafe extern "C" {
     fn flashvita_vita_file_close(fd: i32) -> i32;
     fn flashvita_vita_remove_file(path: *const c_char) -> i32;
     fn flashvita_vita_mkdirs(path: *const c_char) -> i32;
-    fn flashvita_vita_http_fetch_to_file(
+    fn flashvita_vita_http_fetch_start(
         url: *const c_char,
         method: i32,
         body: *const u8,
         body_len: usize,
         content_type: *const c_char,
         destination: *const c_char,
-        http_status: *mut i32,
-    ) -> i32;
+    ) -> *mut c_void;
+    fn flashvita_vita_http_fetch_poll(handle: *mut c_void, http_status: *mut i32) -> i32;
+    fn flashvita_vita_http_fetch_destroy(handle: *mut c_void);
     fn flashvita_vita_log_line(line: *const c_char);
     fn flashvita_vita_logging_enabled() -> i32;
+}
+
+struct NativeHttpFuture {
+    handle: *mut c_void,
+}
+
+impl NativeHttpFuture {
+    fn start(
+        url: &CString,
+        method: i32,
+        body: *const u8,
+        body_len: usize,
+        content_type: &CString,
+        destination: &CString,
+    ) -> Option<Self> {
+        let handle = unsafe {
+            flashvita_vita_http_fetch_start(
+                url.as_ptr(),
+                method,
+                body,
+                body_len,
+                content_type.as_ptr(),
+                destination.as_ptr(),
+            )
+        };
+        (!handle.is_null()).then_some(Self { handle })
+    }
+}
+
+impl Future for NativeHttpFuture {
+    type Output = (i32, i32);
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut status = 0i32;
+        let result = unsafe { flashvita_vita_http_fetch_poll(self.handle, &mut status) };
+        if result == 0 {
+            // The Vita executor is frame-driven; request another poll without
+            // blocking the main Ruffle thread on sceHttp.
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        } else {
+            let handle = std::mem::replace(&mut self.handle, std::ptr::null_mut());
+            unsafe { flashvita_vita_http_fetch_destroy(handle) };
+            Poll::Ready((result, status))
+        }
+    }
+}
+
+impl Drop for NativeHttpFuture {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            unsafe { flashvita_vita_http_fetch_destroy(self.handle) };
+            self.handle = std::ptr::null_mut();
+        }
+    }
 }
 
 pub(crate) fn logging_enabled() -> bool {
@@ -438,7 +495,7 @@ impl VitaNavigatorBackend {
         Some(path)
     }
 
-    fn fetch_sync(&self, request: Request) -> Result<Box<dyn SuccessResponse>, ErrorResponse> {
+    async fn fetch_async(&self, request: Request) -> Result<Box<dyn SuccessResponse>, ErrorResponse> {
         log_line(&format!(
             "net fetch method={} url={}",
             request.method(),
@@ -542,25 +599,27 @@ impl VitaNavigatorBackend {
         let c_content_type = CString::new(content_type).map_err(|_| {
             create_specific_fetch_error("Invalid content type", resolved.as_str(), "embedded NUL")
         })?;
-        let mut status = 0i32;
-
         log_line(&format!(
             "net download_start method={} url={} path={}",
             request.method(),
             resolved,
             destination
         ));
-        let result = unsafe {
-            flashvita_vita_http_fetch_to_file(
-                c_url.as_ptr(),
-                if is_get { 0 } else { 1 },
-                body_ptr,
-                body_len,
-                c_content_type.as_ptr(),
-                c_destination.as_ptr(),
-                &mut status,
-            )
+        let Some(job) = NativeHttpFuture::start(
+            &c_url,
+            if is_get { 0 } else { 1 },
+            body_ptr,
+            body_len,
+            &c_content_type,
+            &c_destination,
+        ) else {
+            return Err(create_specific_fetch_error(
+                "Network worker start failed",
+                resolved.as_str(),
+                "",
+            ));
         };
+        let (result, status) = job.await;
         if result < 0 {
             log_line(&format!(
                 "net download_fail status={} url={}",
@@ -614,7 +673,7 @@ impl NavigatorBackend for VitaNavigatorBackend {
         let gate = self.fetch_gate.clone();
         Box::pin(async move {
             FetchPermit { gate }.await;
-            backend.fetch_sync(request)
+            backend.fetch_async(request).await
         })
     }
 

@@ -56,7 +56,8 @@ void* flashvita_vita_memblock_alloc(size_t bytes, int32_t* uid_out);
 int32_t flashvita_vita_memblock_free(int32_t uid, void* base);
 void* flashvita_vita_vgl_ram_alloc(size_t bytes);
 void flashvita_vita_vgl_ram_free(void* base);
-void flashvita_vita_rust_allocator_enable_vgl(void);
+int32_t flashvita_vita_vgl_ram_owns(const void* ptr);
+void flashvita_vita_rust_allocator_init_cached(void);
 void* flashvita_vita_rust_alloc(size_t bytes, size_t alignment);
 void* flashvita_vita_rust_alloc_zeroed(size_t bytes, size_t alignment);
 void* flashvita_vita_rust_realloc(void* ptr, size_t old_size, size_t alignment,
@@ -71,6 +72,14 @@ int32_t flashvita_vita_http_fetch_to_file(const char* url,
                                           const char* content_type,
                                           const char* destination,
                                           int32_t* http_status);
+void* flashvita_vita_http_fetch_start(const char* url,
+                                      int32_t method,
+                                      const uint8_t* body,
+                                      size_t body_len,
+                                      const char* content_type,
+                                      const char* destination);
+int32_t flashvita_vita_http_fetch_poll(void* handle, int32_t* http_status);
+void flashvita_vita_http_fetch_destroy(void* handle);
 void flashvita_vita_log_line(const char* line);
 int32_t flashvita_vita_logging_enabled(void);
 int32_t flashvita_vita_perf_logging_enabled(void);

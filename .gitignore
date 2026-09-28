@@ -1,1 +1,8 @@
 build/
+.codex_ab/
+.flashvita-avm1-audit.diff
+rust/ruffle_bridge/target/
+build/
+benchmarks/results/
+*.psp2dmp
+*.psp2dmp.tmp

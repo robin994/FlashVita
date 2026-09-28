@@ -19,6 +19,7 @@ public:
     const RuffleProbeInfo& ruffleInfo() const { return ruffle_info_; }
     bool ruffleRunning() const { return ruffle_.running(); }
     bool tick(double dt_ms) { return ruffle_.tick(dt_ms); }
+    bool renderNow() { return ruffle_.renderNow(); }
     bool renderedLastTick() const { return ruffle_.renderedLastTick(); }
     bool virtualKeyboardActive() const { return ruffle_.virtualKeyboardActive(); }
     bool sendKey(FlashKey key, bool down) { return ruffle_.keyEvent(static_cast<int>(key), down); }

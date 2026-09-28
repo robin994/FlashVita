@@ -9,6 +9,7 @@ use ruffle_core::events::{
 use ruffle_core::font::FontQuery;
 use ruffle_core::tag_utils::SwfMovie;
 use ruffle_core::{FloatDuration, Player, PlayerBuilder};
+use ruffle_render::quality::StageQuality;
 #[cfg(target_os = "vita")]
 use ruffle_core::PlayerMode;
 use std::cell::RefCell;
@@ -265,6 +266,26 @@ fn compression_id(compression: Compression) -> u8 {
         Compression::None => 0,
         Compression::Zlib => 1,
         Compression::Lzma => 2,
+    }
+}
+
+fn vita_game_quality(cache_root: &str) -> StageQuality {
+    let path = format!("{cache_root}/quality.txt");
+    let Ok(bytes) = vita_navigator::read_native_file(&path) else {
+        return StageQuality::High;
+    };
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return StageQuality::High;
+    };
+    match text.trim().to_ascii_lowercase().as_str() {
+        "low" => StageQuality::Low,
+        "medium" => StageQuality::Medium,
+        "best" => StageQuality::Best,
+        "8x8" => StageQuality::High8x8,
+        "8x8linear" => StageQuality::High8x8Linear,
+        "16x16" => StageQuality::High16x16,
+        "16x16linear" => StageQuality::High16x16Linear,
+        _ => StageQuality::High,
     }
 }
 
@@ -536,6 +557,11 @@ pub unsafe extern "C" fn flashvita_ruffle_headless_create(
 
     let ui_state = Arc::new(VitaUiState::default());
     let navigator_state = Rc::new(RefCell::new(VitaNavigatorState::new()));
+    let quality = vita_game_quality(cache_root);
+    let zero_copy_bitmapdata = vita_navigator::native_file_size(
+        &format!("{cache_root}/zero_copy_bitmapdata"),
+    )
+    .is_ok();
     let Ok(navigator) = VitaNavigatorBackend::new(
         movie_url,
         cache_root.to_owned(),
@@ -546,26 +572,30 @@ pub unsafe extern "C" fn flashvita_ruffle_headless_create(
     let mut player_builder = PlayerBuilder::new()
         .with_movie(movie)
         .with_autoplay(true)
+        .with_quality(quality)
         .with_viewport_dimensions(960, 544, 1.0)
         .with_ui(VitaUiBackend::new(ui_state.clone()))
         .with_log(VitaLogBackend::new())
         .with_navigator(navigator)
-        .with_renderer(VitaRenderer::new(ruffle_core::ViewportDimensions {
-            width: 960,
-            height: 544,
-            scale_factor: 1.0,
-        }));
+        .with_renderer(VitaRenderer::new(
+            ruffle_core::ViewportDimensions {
+                width: 960,
+                height: 544,
+                scale_factor: 1.0,
+            },
+            zero_copy_bitmapdata,
+        ));
     #[cfg(target_os = "vita")]
     {
-        // AVM1 titles use release semantics for the lowest interpreter overhead.
-        // Keep debugger mode only for AVM2 titles where uncaught bootstrap errors
-        // are otherwise extremely difficult to diagnose on hardware.
-        if probe.has_avm2 != 0 {
+        // Release is the production default for both AVM1 and AVM2. A single
+        // title can opt into Debug by placing `debug_player_mode` in its gamefiles root.
+        let debug_marker = format!("{cache_root}/debug_player_mode");
+        if vita_navigator::native_file_size(&debug_marker).is_ok() {
             player_builder = player_builder.with_player_mode(PlayerMode::Debug);
-            vita_navigator::log_line("diagnostic player_mode=debug avm=avm2");
+            vita_navigator::log_line("diagnostic player_mode=debug override=per_game");
         } else {
             player_builder = player_builder.with_player_mode(PlayerMode::Release);
-            vita_navigator::log_line("diagnostic player_mode=release avm=avm1");
+            vita_navigator::log_line("diagnostic player_mode=release");
         }
         // Large desktop-era SWFs can legitimately spend far longer than the
         // desktop default 15 seconds in their first AVM2 bootstrap on Vita.
@@ -610,7 +640,9 @@ pub unsafe extern "C" fn flashvita_ruffle_headless_update(
         return -2;
     };
     player.tick(FloatDuration::from_millis(dt_ms.max(0.0)));
+    let needs_render = player.needs_render();
     handle.profile_ticks = handle.profile_ticks.wrapping_add(1);
+    #[cfg(feature = "vita-profile")]
     if handle.profile_ticks % 30 == 0 && perf_logging_enabled() {
         let p = player.vita_frame_profile();
         vita_navigator::log_line(&format!(
@@ -679,7 +711,7 @@ pub unsafe extern "C" fn flashvita_ruffle_headless_update(
     }
     drop(player);
     handle.navigator_state.borrow_mut().pump();
-    1
+    i32::from(needs_render)
 }
 
 #[no_mangle]

@@ -1,7 +1,9 @@
 #include <psp2/ctrl.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
+#include <psp2/display.h>
 #include <psp2/kernel/clib.h>
+#include <psp2/kernel/sysmem.h>
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/power.h>
 #include <psp2/touch.h>
@@ -21,10 +23,9 @@
 #include "version.h"
 
 extern "C" {
-// Ruffle/AVM2 needs substantially more than VitaSDK's default 128 MB heap for
-// large AS3 games. Reserve the larger heap before main; vitaGL will size its
-// own RAM pool from the memory that remains.
-unsigned int _newlib_heap_size_user = 192u * 1024u * 1024u;
+// Ruffle now has its own cached 64/48/32 MB mspace. Keep newlib at 128 MB for
+// libc/pthread and allocator fallback instead of reserving another 192 MB.
+unsigned int _newlib_heap_size_user = 128u * 1024u * 1024u;
 unsigned int _get_vita_heap_size(void);
 }
 
@@ -35,6 +36,18 @@ void logMarker(const char* marker) {
     flashvita::vita::appendTextFile(
         "ux0:data/FlashVita/runtime.log",
         std::string(marker) + "\n");
+}
+
+void writeBootMarker(const char* marker) {
+    if (!marker) return;
+    const std::string line = std::string(marker) + "\n";
+    const SceUID fd = sceIoOpen(
+        "ux0:data/FlashVita/runtime.log",
+        SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND,
+        0666);
+    if (fd < 0) return;
+    sceIoWrite(fd, line.data(), static_cast<SceSize>(line.size()));
+    sceIoClose(fd);
 }
 
 void ensureDataDirectories() {
@@ -101,7 +114,9 @@ int main() {
     sceIoRemove("ux0:data/FlashVita/runtime.log");
     logMarker("pre_vita_native_init");
     const bool native_platform_ok = flashvita::vita::initialize();
-    logMarker("FLASHVITA_BOOT " FLASHVITA_VERSION_LABEL "-" FLASHVITA_BUILD_TAG);
+    // Keep a single unconditional boot marker even when runtime logging is off.
+    // Deployment uses it to prove that VitaCompanion launched the new eboot.
+    writeBootMarker("FLASHVITA_BOOT " FLASHVITA_VERSION_LABEL "-" FLASHVITA_BUILD_TAG);
     logMarker(native_platform_ok ? "vita_native_init_pass" : "vita_native_init_fail");
     {
         char marker[96];
@@ -112,17 +127,39 @@ int main() {
 
     logMarker("config_loaded");
     requestGameClocks();
+    // Reserve the CPU-hot Rust heap before vitaGL takes ownership of the
+    // remaining system memory. The allocator falls back to newlib if this
+    // reservation cannot be satisfied.
+    flashvita_vita_rust_allocator_init_cached();
 
     sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG_WIDE);
     sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_START);
     sceTouchSetSamplingState(SCE_TOUCH_PORT_BACK, SCE_TOUCH_SAMPLING_STATE_START);
 
     vglSetSemanticBindingMode(VGL_MODE_SHADER_PAIR);
+    // Keep vitaGL's system-RAM pool cached. Ruffle's heap currently spills into
+    // this pool, and uncached mappings make GC/display-list traversal extremely expensive.
+    vglUseCachedMem(GL_TRUE);
     vglInitExtended(0, 960, 544, 0x1000000, SCE_GXM_MULTISAMPLE_NONE);
     vglWaitVblankStart(config.vsync ? GL_TRUE : GL_FALSE);
     bool applied_vsync = config.vsync;
     logMarker("vitagl_init_pass");
-    flashvita_vita_rust_allocator_enable_vgl();
+    if (flashvita::vita::loggingEnabled()) {
+        void* cache_probe = vglAlloc(64, VGL_MEM_RAM);
+        if (cache_probe) {
+            SceKernelMemBlockInfo info{};
+            info.size = sizeof(info);
+            if (sceKernelGetMemBlockInfoByAddr(cache_probe, &info) >= 0) {
+                char marker[128];
+                sceClibSnprintf(marker, sizeof(marker),
+                                "vitagl_ram_memory_type=0x%X memblock_type=0x%X",
+                                static_cast<unsigned>(info.memoryType),
+                                static_cast<unsigned>(info.type));
+                logMarker(marker);
+            }
+            vglFree(cache_probe);
+        }
+    }
     {
         char marker[160];
         sceClibSnprintf(marker, sizeof(marker),
@@ -233,6 +270,13 @@ int main() {
                 runtime_input.update(player, input.profile(), toggle_chord ? kUiToggleMask : 0);
             }
             player.tick(dt_ms);
+            // The software cursor is drawn after Ruffle. If Ruffle skipped this
+            // host tick, swapping only the cursor would expose a stale backbuffer
+            // and produce trails/alternating old frames.
+            if (!ui.launchLoading() && runtime_input.cursorVisible() &&
+                !player.renderedLastTick()) {
+                player.renderNow();
+            }
             if (ui.launchLoading() &&
                 flashvita::RuffleRuntime::visibleDrawCount() > launch_visible_draw_baseline) {
                 loading_ready_to_show_game = true;
@@ -272,8 +316,16 @@ int main() {
                 logMarker(marker);
             }
         }
+        const bool should_present = ui_visible || !player_running || ui.launchLoading() ||
+            player.renderedLastTick() || player.virtualKeyboardActive() ||
+            runtime_input.cursorVisible();
         const uint64_t swap_begin_us = profile_frame ? sceKernelGetProcessTimeWide() : 0;
-        vglSwapBuffers(player.virtualKeyboardActive() ? GL_TRUE : GL_FALSE);
+        if (should_present) {
+            vglSwapBuffers(player.virtualKeyboardActive() ? GL_TRUE : GL_FALSE);
+        } else {
+            // Keep 60 Hz host pacing without resubmitting the same Flash frame.
+            sceDisplayWaitVblankStart();
+        }
         const uint64_t swap_us = profile_frame ? sceKernelGetProcessTimeWide() - swap_begin_us : 0;
 
         if (loading_ready_to_show_game) {

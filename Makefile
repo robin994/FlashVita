@@ -9,11 +9,14 @@ TITLE_NAME := FlashVita
 BUILD_ROOT ?= build
 
 ENABLE_RUFFLE ?= 1
+VITA_PROFILE ?= 0
 BUILD_VARIANT := $(if $(filter 1,$(ENABLE_RUFFLE)),ruffle,shell)
 BUILD_DIR := $(BUILD_ROOT)/$(BUILD_VARIANT)
 RUFFLE_BRIDGE_DIR := rust/ruffle_bridge
 RUFFLE_TARGET := armv7-sony-vita-newlibeabihf
-RUFFLE_TARGET_DIR ?= $(BUILD_ROOT)/cargo-target
+RUFFLE_PROFILE_SUFFIX := $(if $(filter 1,$(VITA_PROFILE)),-profile,)
+RUFFLE_TARGET_DIR ?= $(BUILD_ROOT)/cargo-target$(RUFFLE_PROFILE_SUFFIX)
+RUFFLE_CARGO_FEATURES := $(if $(filter 1,$(VITA_PROFILE)),--features vita-profile,)
 RUFFLE_LIB := $(RUFFLE_TARGET_DIR)/$(RUFFLE_TARGET)/release/libflashvita_ruffle_bridge.a
 RUFFLE_BRIDGE_SOURCES := $(wildcard $(RUFFLE_BRIDGE_DIR)/src/*.rs) $(RUFFLE_BRIDGE_DIR)/Cargo.toml $(RUFFLE_BRIDGE_DIR)/Cargo.lock
 RUFFLE_VENDOR_SOURCES := $(shell find third_party/ruffle -type f \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' \) 2>/dev/null)
@@ -56,9 +59,7 @@ CXXFLAGS += -DFLASHVITA_ENABLE_RUFFLE=0
 RUFFLE_LINK_INPUT :=
 endif
 
-LDFLAGS := -Wl,-q -Wl,--gc-sections \
-	-Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc -Wl,--wrap=free \
-	-L$(IMGUI_VITA_DIR) -L$(VITAGL_DIR)
+LDFLAGS := -Wl,-q -Wl,--gc-sections -L$(IMGUI_VITA_DIR) -L$(VITAGL_DIR)
 LIBS := \
 	-limgui \
 	-lvitaGL \
@@ -106,6 +107,7 @@ $(RUFFLE_LIB): $(RUFFLE_BRIDGE_SOURCES) $(RUFFLE_VENDOR_SOURCES)
 		--locked \
 		--release \
 		--target $(RUFFLE_TARGET) \
+		$(RUFFLE_CARGO_FEATURES) \
 		--manifest-path $(RUFFLE_BRIDGE_DIR)/Cargo.toml
 
 ruffle-check:

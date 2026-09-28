@@ -659,12 +659,15 @@ bool RuffleRuntime::tick(double dt_ms) {
         if (result < 0) return false;
     }
 
-    const uint64_t render_begin_us = profile ? sceKernelGetProcessTimeWide() : 0;
-    result = flashvita_ruffle_headless_render(handle_);
-    if (profile) render_us = sceKernelGetProcessTimeWide() - render_begin_us;
-    if (result < 0) return false;
-
-    rendered_last_tick_ = result > 0;
+    const bool needs_render = result > 0 || ime_active_;
+    rendered_last_tick_ = false;
+    if (needs_render) {
+        const uint64_t render_begin_us = profile ? sceKernelGetProcessTimeWide() : 0;
+        result = flashvita_ruffle_headless_render(handle_);
+        if (profile) render_us = sceKernelGetProcessTimeWide() - render_begin_us;
+        if (result < 0) return false;
+        rendered_last_tick_ = result > 0;
+    }
     ++tick_counter_;
     if (!profile) {
         perf_ticks_ = 0;
@@ -696,6 +699,17 @@ bool RuffleRuntime::tick(double dt_ms) {
     return true;
 #else
     (void)dt_ms;
+    return false;
+#endif
+}
+
+bool RuffleRuntime::renderNow() {
+#if FLASHVITA_ENABLE_RUFFLE
+    if (!handle_) return false;
+    const int32_t result = flashvita_ruffle_headless_render(handle_);
+    rendered_last_tick_ = result > 0;
+    return result >= 0;
+#else
     return false;
 #endif
 }
